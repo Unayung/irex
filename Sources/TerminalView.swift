@@ -17,6 +17,7 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     var onPaneSwipe: ((PaneSwipe) -> Void)?
     var onFontSizeChange: ((CGFloat) -> Void)?
     var onCellTap: ((Int, Int) -> Void)?         // column, row of the server's screen
+    var onPasteImage: ((UIImage) -> Void)?       // pasting an image attaches it instead
     let interactive: Bool                        // false: a preview that only draws
 
     private var font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
@@ -329,11 +330,14 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     func deleteBackward() { sendKey(GHOSTTY_KEY_BACKSPACE, mods: 0, text: "", unshifted: 0) }
 
     override func paste(_ sender: Any?) {
-        if let s = UIPasteboard.general.string { model.scrollToBottom(); onInput?(model.encodePaste(s)) }
+        let board = UIPasteboard.general
+        if board.hasStrings, let s = board.string { model.scrollToBottom(); onInput?(model.encodePaste(s)) }
+        else if board.hasImages, let image = board.image { onPasteImage?(image) }   // a screenshot, say
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        action == #selector(paste(_:)) ? UIPasteboard.general.hasStrings : super.canPerformAction(action, withSender: sender)
+        action == #selector(paste(_:)) ? UIPasteboard.general.hasStrings || UIPasteboard.general.hasImages
+                                       : super.canPerformAction(action, withSender: sender)
     }
 
     // MARK: key bar

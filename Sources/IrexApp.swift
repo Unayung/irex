@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 @main
@@ -18,6 +19,7 @@ final class AppModel: ObservableObject {
         let status: String
         let detail: String   // what the agent says it's doing
         let since: Date?     // when its status last changed
+        let agent: String    // the coding agent in front, such as claude, or ""
     }
     struct Tab: Identifiable { let id: String; let label: String; let panes: [Pane] }
     struct Session: Identifiable { let id: String; let label: String; let host: String?; let tabs: [Tab] }
@@ -33,9 +35,12 @@ final class AppModel: ObservableObject {
     @Published private var statuses: [String: String] = [:]         // block ID → working / blocked / done
     @Published private var details: [String: String] = [:]          // block ID → the status's message
     @Published private var since: [String: Date] = [:]              // block ID → when the status changed
+    @Published private var agents: [String: String] = [:]           // block ID → the agent running in it
     @Published var status = ""
     @Published var connected = false
     @Published var connecting = false
+    /// Connecting again with the last list still up, shown dimmed under a banner until the new one lands.
+    @Published var reconnecting = false
     @Published var stream: BlockStream?
     @Published var openPaneId: String?
     private var controls: [String: RexControl] = [:]
@@ -56,7 +61,7 @@ final class AppModel: ObservableObject {
                         guard let id = b["block_id"] as? String else { return nil }
                         let title = titles[id].flatMap { $0.isEmpty ? nil : $0 } ?? b["label"] as? String ?? "Pane"
                         return Pane(id: id, sessionId: s.id, sessionLabel: s.label, title: title, status: statuses[id] ?? "",
-                                    detail: details[id] ?? "", since: since[id])
+                                    detail: details[id] ?? "", since: since[id], agent: agents[id] ?? "")
                     })
                 })
             }
@@ -89,21 +94,24 @@ final class AppModel: ObservableObject {
     // MARK: connecting
 
     func connect(_ address: String) async {
-        disconnect()
+        let hadList = !(hostSessions["local"] ?? []).isEmpty
+        disconnect(keepList: hadList)
         guard let ep = RexEndpoint(address) else { status = "That isn't a server address."; return }
         status = ""
         connecting = true
-        hostOrder = ["local"]
+        reconnecting = hadList
+        if hostOrder.isEmpty { hostOrder = ["local"] }
         let ok = await connectHost("local", endpoint: ep)
         connecting = false
-        guard ok else { return }
+        reconnecting = false
+        guard ok else { disconnect(); return }
         connected = true
         await refreshHosts()
         #if DEBUG
         // `-openPane <title>` at launch opens the first pane whose title has it, for simulator checks.
         if let want = UserDefaults.standard.string(forKey: "openPane") {
             try? await Task.sleep(for: .seconds(2))
-            if let p = sessions.flatMap(\.tabs).flatMap(\.panes).first(where: { $0.title.contains(want) }) { await open(p) }
+            if let p = sessions.flatMap(\.tabs).flatMap(\.panes).first(where: { $0.title.contains(want) || $0.sessionLabel == want }) { await open(p) }
         }
         #endif
     }
@@ -136,9 +144,10 @@ final class AppModel: ObservableObject {
         controls[key] = nil
         if let open = stream?.sessionId, sessionHost[open] == key { closePane() }
         if key == "local" {
-            // Without the first server there's no host list either; start over on the next connect.
+            // Without the first server there's no host list either; the next connect starts over,
+            // with the old list up until the new one lands.
             status = "Disconnected: \(reason)"
-            disconnect()
+            disconnect(keepList: true)
         } else {
             hostSessions[key] = nil
             hostProblems[key] = "Disconnected"
@@ -162,14 +171,16 @@ final class AppModel: ObservableObject {
         hostOrder = ["local"] + listed
     }
 
-    func disconnect() {
+    /// Closes every connection. `keepList` leaves the sessions up for a reconnect to replace.
+    func disconnect(keepList: Bool = false) {
         closePane()
         // Reconnecting on the way to a pane keeps you on its screen.
         if let w = wanted { openPaneId = w.block }
         for c in controls.values { c.onClose = nil; c.close() }
         controls = [:]
         connected = false
-        hostOrder = []; hostSessions = [:]; hostProblems = [:]; views = [:]; sessionHost = [:]
+        hostProblems = [:]
+        if !keepList { hostOrder = []; hostSessions = [:]; views = [:]; sessionHost = [:] }
     }
 
     var isIdle: Bool { controls["local"] == nil }
@@ -200,6 +211,7 @@ final class AppModel: ObservableObject {
                 let p = block["payload"] as? [String: Any] ?? [:]
                 switch block["name"] as? String {
                 case "title_changed": titles[blockId] = p["title"] as? String ?? ""
+                case "process_changed": Task { await fetchAgent(sessionId, blockId) }   // someone started or left an agent
                 case "program_status_changed": record(blockId, p["record"] as? [String: Any])
                 case "program_status_removed": record(blockId, nil)
                 case "url_clicked":
@@ -213,6 +225,15 @@ final class AppModel: ObservableObject {
             }
         default: break
         }
+    }
+
+    /// Which coding agent runs in front in a pane, from its process, as orex tells.
+    private func fetchAgent(_ sessionId: String, _ block: String) async {
+        guard let c = control(for: sessionId),
+              let r = try? await c.call("com.superlogical.terminal.process", ["session_id": sessionId, "block_id": block, "args": [String: Any]()]),
+              let fg = r["foreground"] as? [String: Any] else { return }
+        let text = ["name", "argv0", "path"].compactMap { fg[$0] as? String }.joined(separator: " ").lowercased()
+        agents[block] = ["claude", "hermes", "codex", "opencode", "copilot", "kimi", "gemini"].first { text.contains($0) } ?? ""
     }
 
     /// A program status record (OSC 7501): its state, message, and when it was reported.
@@ -257,6 +278,7 @@ final class AppModel: ObservableObject {
                     let target: [String: Any] = ["session_id": sessionId, "block_id": id, "args": [String: Any]()]
                     Task {
                         if let t = try? await c.call("com.superlogical.terminal.title", target)["title"] as? String, !t.isEmpty { titles[id] = t }
+                        await fetchAgent(sessionId, id)
                         // A status set before irex connected only comes from here.
                         if let r = try? await c.call("com.superlogical.terminal.program_status", target),
                            let first = (r["records"] as? [[String: Any]])?.first { record(id, first) }
@@ -369,6 +391,12 @@ struct ContentView: View {
     @State private var settingsShown = false
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
+    @State private var query = ""
+    @State private var photosShown = false
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var cameraShown = false
+    @State private var filesShown = false
+    @State private var welcome = false
     @State private var swipeDX: CGFloat = 0        // how far the terminal follows a sideways swipe
     @State private var swipeArmed = false          // past the point where letting go switches panes
 
@@ -376,8 +404,31 @@ struct ContentView: View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if app.reconnecting {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Reconnecting…").font(.footnote.weight(.medium))
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(.thinMaterial, in: Capsule())
+                        .frame(maxWidth: .infinity)
+                    } else if !app.connected && !app.connecting && !app.sessions.isEmpty {
+                        // The list is what it was when the connection went; say so, and offer to try again.
+                        Button { Task { await app.connect(server) } } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "bolt.horizontal.circle")
+                                Text("Disconnected · Try again")
+                            }
+                            .font(.footnote.weight(.medium))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.thinMaterial, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity)
+                    }
+                    let shown = filtered(app.sessions)
                     // Who's waiting on you comes first, wherever their sessions are.
-                    let waiting = app.sessions.filter { !push.muted.contains($0.id) }.flatMap(\.tabs).flatMap(\.panes)
+                    let waiting = shown.filter { !push.muted.contains($0.id) }.flatMap(\.tabs).flatMap(\.panes)
                         .filter { $0.status == "blocked" && !push.muted.contains($0.id) }
                     if !waiting.isEmpty {
                         Text("Needs you").font(.footnote.weight(.semibold)).foregroundStyle(.red).textCase(.uppercase)
@@ -388,16 +439,22 @@ struct ContentView: View {
                         Text("Sessions").font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
                             .padding(.leading, 4).padding(.top, 6)
                     }
-                    ForEach(app.sessions) { s in
+                    ForEach(shown) { s in
                         SessionCard(session: s, mutedIDs: push.muted, openPaneId: app.openPaneId,
                                     onOpen: { p in Task { await app.open(p) } },
-                                    onMute: { id, on in push.setMuted(id, on) })
+                                    onMute: { id, on in push.setMuted(id, on) },
+                                    searching: !query.isEmpty)
+                    }
+                    if !query.isEmpty && shown.isEmpty {
+                        ContentUnavailableView.search(text: query).padding(.top, 40)
                     }
                 }
+                .opacity(app.connected ? 1 : 0.6)
                 .padding(.horizontal, 14).padding(.vertical, 8)
                 .animation(.default, value: app.sessions.flatMap(\.tabs).flatMap(\.panes).map(\.status))
             }
             .background(Color(.systemGroupedBackground))
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Panes and sessions")
             .overlay {
                 if app.connecting && app.sessions.isEmpty {
                     ProgressView("Connecting…")
@@ -407,7 +464,10 @@ struct ContentView: View {
                     } description: {
                         Text(app.connected ? "Start one with rex new on the server." : app.status)
                     } actions: {
-                        if !app.connected { Button("Settings") { settingsShown = true } }
+                        if !app.connected {
+                            Button("Try again") { Task { await app.connect(server) } }.buttonStyle(.borderedProminent)
+                            Button("Settings") { settingsShown = true }
+                        }
                     }
                 }
             }
@@ -440,14 +500,26 @@ struct ContentView: View {
                 if let s = app.stream {
                     PaneHeader(stream: s, pane: app.pane(s.blockId), compact: sizeClass == .compact,
                                onBack: { if sizeClass == .compact { app.closePane() } else { columns = columns == .detailOnly ? .all : .detailOnly } },
-                               onCompose: { composing = true })
+                               onCompose: { composing = true },
+                               onAttach: { source in
+                                   switch source {
+                                   case .photos: photosShown = true
+                                   case .camera: cameraShown = true
+                                   case .files: filesShown = true
+                                   }
+                               })
                     TerminalRepresentable(stream: s, fontSize: fontSize, focusOnOpen: sizeClass != .compact,
                                           onEdgeSwipe: { if sizeClass == .compact { app.closePane() } else { columns = .all } },
                                           onEdgeHover: { _ in },
                                           onCompose: { composing = true },
                                           onPaneSwipe: { paneSwipe($0) },
                                           onFontSizeChange: { fontSize = $0 },
-                                          onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) })
+                                          onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) },
+                                          onPasteImage: { image in
+                                              if let a = Attachments.screenshot(image, name: "pasted-" + Attachments.stamp(0, of: 1)) {
+                                                  Task { await s.attach([a]) }
+                                              }
+                                          })
                         .id(s.blockId)
                         .offset(x: swipeDX)
                         .background(Color(.systemGroupedBackground))
@@ -461,6 +533,8 @@ struct ContentView: View {
                             }
                         }
                         .clipped()
+                        .overlay(alignment: .top) { UploadNote(stream: s) }
+                        .animation(.snappy, value: s.uploadNote)
                 } else if app.opening {
                     Spacer(); ProgressView("Opening…"); Spacer()
                 } else {
@@ -481,6 +555,32 @@ struct ContentView: View {
         .sheet(isPresented: $composing) {
             if let s = app.stream { ComposeView(stream: s).presentationDetents([.medium, .large]) }
         }
+        .photosPicker(isPresented: $photosShown, selection: $photoItems, maxSelectionCount: 5, matching: .images)
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty, let s = app.stream else { return }
+            photoItems = []
+            Task { await s.attach(await Attachments.photos(items)) }
+        }
+        .fullScreenCover(isPresented: $cameraShown) {
+            CameraPicker { image in
+                guard let s = app.stream, let a = Attachments.photo(image, name: "photo-" + Attachments.stamp(0, of: 1)) else { return }
+                Task { await s.attach([a]) }
+            }
+            .ignoresSafeArea()
+        }
+        .fileImporter(isPresented: $filesShown, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            guard let s = app.stream, case .success(let urls) = result else { return }
+            let files = Attachments.files(urls)
+            Task { await s.attach(files) }
+        }
+        .fullScreenCover(isPresented: $welcome) {
+            WelcomeView { address in
+                server = address
+                welcome = false
+                push.start(server: address)
+                Task { await app.connect(address) }
+            }
+        }
         .sheet(isPresented: $settingsShown) { SettingsView(app: app, server: $server, fontSize: $fontSize, keepAwake: $keepAwake) }
         // Watching an agent work shouldn't lock the phone.
         .onChange(of: keepAwake && app.stream != nil, initial: true) { _, on in UIApplication.shared.isIdleTimerDisabled = on }
@@ -490,7 +590,7 @@ struct ContentView: View {
             // `-openBlock <ID>` at launch takes the path a tapped notification takes, before connecting.
             if let id = UserDefaults.standard.string(forKey: "openBlock") { push.pendingBlock = id }
             #endif
-            if server.isEmpty { settingsShown = true; return }
+            if server.isEmpty { welcome = true; return }
             #if DEBUG
             let review = UserDefaults.standard.bool(forKey: "noPush")   // simulator review: no permission prompt
             #else
@@ -501,6 +601,18 @@ struct ContentView: View {
             #if DEBUG
             // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
             if UserDefaults.standard.bool(forKey: "showSettings") { settingsShown = true }
+            if let q = UserDefaults.standard.string(forKey: "query") { query = q }   // `-query <text>`
+            if let demo = UserDefaults.standard.string(forKey: "demoActivity") { push.demoActivity(demo) }
+            if UserDefaults.standard.bool(forKey: "renderActivity") { push.renderActivity() }
+            // `-attachTest YES` with `-openPane <title>`: attaches a generated image to that pane.
+            if UserDefaults.standard.bool(forKey: "attachTest") {
+                try? await Task.sleep(for: .seconds(6))
+                let image = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 120)).image { ctx in
+                    UIColor.systemTeal.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 320, height: 120))
+                    ("irex attach test" as NSString).draw(at: CGPoint(x: 20, y: 44), withAttributes: [.font: UIFont.boldSystemFont(ofSize: 28)])
+                }
+                if let s = app.stream, let a = Attachments.screenshot(image, name: "attach-test") { await s.attach([a]) }
+            }
             // `-swipeDX <points>` (or `-swipeLeft <points>`) holds a sideways swipe that far, to look at its preview.
             let hold = UserDefaults.standard.double(forKey: "swipeDX") - UserDefaults.standard.double(forKey: "swipeLeft")
             if hold != 0 {
@@ -613,6 +725,20 @@ struct SettingsView: View {
 extension ContentView {
     static let swipeThreshold: CGFloat = 90
 
+    /// Sessions whose name matches the search, whole; otherwise the panes that match, by title or activity.
+    func filtered(_ sessions: [AppModel.Session]) -> [AppModel.Session] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return sessions }
+        return sessions.compactMap { s in
+            if s.label.localizedCaseInsensitiveContains(q) { return s }
+            let tabs = s.tabs.compactMap { t -> AppModel.Tab? in
+                let panes = t.panes.filter { $0.title.localizedCaseInsensitiveContains(q) || $0.detail.localizedCaseInsensitiveContains(q) }
+                return panes.isEmpty ? nil : AppModel.Tab(id: t.id, label: t.label, panes: panes)
+            }
+            return tabs.isEmpty ? nil : AppModel.Session(id: s.id, label: s.label, host: s.host, tabs: tabs)
+        }
+    }
+
     /// Follows a sideways swipe: the terminal moves with the finger, a card shows where letting go
     /// leads, and past the threshold it lights up, with a tap, before anything switches.
     func paneSwipe(_ e: TerminalView.PaneSwipe) {
@@ -654,6 +780,7 @@ struct TerminalRepresentable: UIViewRepresentable {
     let onPaneSwipe: (TerminalView.PaneSwipe) -> Void
     let onFontSizeChange: (Double) -> Void
     let onCellTap: (Int, Int) -> Void
+    let onPasteImage: (UIImage) -> Void
 
     func makeUIView(context: Context) -> TerminalView {
         let v = TerminalView(model: stream.terminal)
@@ -667,6 +794,7 @@ struct TerminalRepresentable: UIViewRepresentable {
         v.onPaneSwipe = onPaneSwipe
         v.onFontSizeChange = { onFontSizeChange(Double($0)) }
         v.onCellTap = onCellTap
+        v.onPasteImage = onPasteImage
         Task {
             await stream.start()
             // iPad: ready for a hardware keyboard. iPhone: watch first; tap to bring up the keyboard.

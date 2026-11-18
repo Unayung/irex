@@ -31,7 +31,12 @@ Tap a pane to open it, and the button in its corner (or a swipe from the left
 edge) to go back. Swipe sideways to go to the session's next or previous pane.
 Long-press and drag to select and copy, pinch to change the text size, and tap
 a link a program marks (OSC 8) to open it. The pencil opens a box for a longer
-message, with dictation, sent as one paste.
+message, with dictation, sent as one paste. The paperclip attaches photos, a
+picture from the camera, or files: Rex puts them on the pane's machine and types
+their paths, so an agent can read them. Pasting an image does the same.
+
+Pull the list down to search panes and sessions. Idle panes fold away in a
+session that has a few, and panes running a coding agent show its mark.
 
 Above the keyboard sit the keys a terminal needs that the software keyboard
 lacks: esc, ctrl (it applies to the next key), tab, shift-tab, the arrows (hold
@@ -94,6 +99,11 @@ listed in `rex hosts`.
 ## Not yet
 
 Split layouts (a pane opens on its own), answering from a notification, and file upload.
+
+## Agent icons
+
+Claude, OpenAI (Codex), GitHub Copilot, Google Gemini, OpenCode, and Kimi come
+from [Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
 
 ## License
 

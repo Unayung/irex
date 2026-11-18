@@ -22,6 +22,9 @@ final class BlockStream: ObservableObject {
     /// Whether irex sizes this pane. Until it does, the pane keeps the owner's size and irex
     /// shows it scaled down, so watching from a phone doesn't reflow it on the Mac.
     @Published private(set) var owning = false
+    /// How an attachment is going: "Uploading photo.jpg…", "Attached photo.jpg", or what went wrong.
+    @Published private(set) var uploadNote: String?
+    @Published private(set) var uploadFailed = false
     /// Take the pane as soon as it opens and when irex comes back, instead of watching first.
     var fitOnOpen = false
 
@@ -127,6 +130,57 @@ final class BlockStream: ObservableObject {
     func sendText(_ text: String, enter: Bool) {
         send(terminal.encodePaste(text))
         if enter { send(terminal.enterKey) }
+    }
+
+    /// A file to hand to the pane's program: Rex puts it on the pane's machine and types its path.
+    struct Attachment { let name: String; let data: Data }
+
+    func attach(_ files: [Attachment]) async {
+        guard !files.isEmpty else { return }
+        let what = files.count == 1 ? files[0].name : "\(files.count) files"
+        uploadNote = "Uploading \(what)…"
+        uploadFailed = false
+        let batch = UUID().uuidString.lowercased()
+        var problem: String?
+        for (i, f) in files.enumerated() {
+            do { try await upload(f, batch: batch, index: i, count: files.count) } catch {
+                problem = "\(f.name) couldn't be attached: \(error)"
+            }
+        }
+        uploadFailed = problem != nil
+        let note = problem ?? "Attached \(what)"
+        uploadNote = note
+        try? await Task.sleep(for: .seconds(problem == nil ? 2.5 : 5))
+        if uploadNote == note { uploadNote = nil }
+    }
+
+    /// The same handshake as the terminal stream, on `rex.data.bytes.v1`: then the file, then an
+    /// empty message to say it's all there, and the server closes with 1000 once it has typed the path.
+    private func upload(_ f: Attachment, batch: String, index: Int, count: Int) async throws {
+        let args: [String: Any] = ["ref": "upload:" + UUID().uuidString.lowercased(), "name": f.name, "size": f.data.count,
+                                   "batch": batch, "index": index, "count": count]
+        let r = try await control.call("com.superlogical.terminal.upload_begin", ["session_id": sessionId, "block_id": blockId, "args": args])
+        guard let ticket = (r["ticket"] as? String).flatMap(Self.base64url), ticket.count == 16 else {
+            throw RexError(description: "no upload ticket")
+        }
+        let ep = control.endpoint
+        let t = session.webSocketTask(with: ep.socketURL("/api/data"), protocols: ep.protocols("rex.data.bytes.v1"))
+        t.resume()
+        defer { t.cancel(with: .normalClosure, reason: nil) }
+        try await t.send(.data(Data([0x01]) + ticket))
+        guard case .data(let welcome) = try await t.receive(), welcome.first == 0x81 else {
+            throw RexError(description: "the server refused it")
+        }
+        var offset = 0
+        while offset < f.data.count {
+            let end = min(offset + 64 * 1024, f.data.count)
+            try await t.send(.data(f.data.subdata(in: offset..<end)))
+            offset = end
+        }
+        try await t.send(.data(Data()))
+        // Read until the server closes; how it closes says whether the file arrived.
+        while (try? await t.receive()) != nil {}
+        guard t.closeCode == .normalClosure else { throw RexError(description: "it didn't finish (\(t.closeCode.rawValue))") }
     }
 
     /// A left click at a cell of the server's screen. A link (OSC 8) there comes back as a

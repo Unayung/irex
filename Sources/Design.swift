@@ -23,6 +23,21 @@ enum Status {
     }
 }
 
+/// The mark of the coding agent in a pane (Simple Icons, CC0), when there is one.
+struct AgentIcon: View {
+    let agent: String
+    var size: CGFloat = 14
+
+    private static let assets = ["claude": "agent-claude", "codex": "agent-openai", "copilot": "agent-githubcopilot",
+                                 "gemini": "agent-googlegemini", "opencode": "agent-opencode", "kimi": "agent-kimi"]
+
+    var body: some View {
+        if let name = Self.assets[agent] {
+            Image(name).resizable().scaledToFit().frame(width: size, height: size).accessibilityLabel(agent)
+        }
+    }
+}
+
 /// A pane's status at a glance: pulses while working, a check when done, hollow when idle.
 struct StatusGlyph: View {
     let status: String
@@ -70,8 +85,11 @@ struct PaneLine: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             StatusGlyph(status: pane.status)
             VStack(alignment: .leading, spacing: 2) {
-                Text(pane.title).font(.body.weight(pane.status.isEmpty ? .regular : .medium)).lineLimit(1)
-                    .foregroundStyle(pane.status.isEmpty ? .secondary : .primary)
+                HStack(spacing: 6) {
+                    AgentIcon(agent: pane.agent)
+                    Text(pane.title).font(.body.weight(pane.status.isEmpty ? .regular : .medium)).lineLimit(1)
+                        .foregroundStyle(pane.status.isEmpty ? .secondary : .primary)
+                }
                 if !pane.detail.isEmpty || (pane.since != nil && !pane.status.isEmpty) {
                     ActivityLine(detail: pane.detail, since: pane.status.isEmpty ? nil : pane.since)
                 }
@@ -92,8 +110,19 @@ struct SessionCard: View {
     let openPaneId: String?
     let onOpen: (AppModel.Pane) -> Void
     let onMute: (String, Bool) -> Void
+    var searching = false
+    @State private var showIdle = false
 
     private var sessionMuted: Bool { mutedIDs.contains(session.id) }
+
+    /// Idle panes fold away behind one row when there are a few of them, so busy ones stand out.
+    /// The open pane always shows, and nothing folds while searching.
+    private var folded: (shown: [AppModel.Pane], idle: Int)? {
+        let panes = session.tabs.flatMap(\.panes)
+        let idle = panes.filter { $0.status.isEmpty && $0.id != openPaneId }
+        guard !searching, !showIdle, idle.count >= 2 else { return nil }
+        return (panes.filter { !$0.status.isEmpty || $0.id == openPaneId }, idle.count)
+    }
 
     private var summary: String {
         let panes = session.tabs.flatMap(\.panes)
@@ -127,28 +156,20 @@ struct SessionCard: View {
             }
             .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
 
-            ForEach(session.tabs) { tab in
-                if session.tabs.count > 1 {
-                    Text(tab.label.isEmpty ? "Tab" : tab.label)
-                        .font(.caption.weight(.semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
-                        .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 2)
-                }
-                ForEach(tab.panes) { pane in
-                    let paneMuted = mutedIDs.contains(pane.id)
-                    Button { onOpen(pane) } label: {
-                        PaneLine(pane: pane, muted: paneMuted || sessionMuted, selected: pane.id == openPaneId)
+            if let folded {
+                ForEach(folded.shown) { row($0) }
+                foldRow(folded.idle == session.tabs.flatMap(\.panes).count
+                        ? "\(folded.idle) idle panes" : "\(folded.idle) more idle panes", open: false)
+            } else {
+                ForEach(session.tabs) { tab in
+                    if session.tabs.count > 1 {
+                        Text(tab.label.isEmpty ? "Tab" : tab.label)
+                            .font(.caption.weight(.semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
+                            .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 2)
                     }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button { onMute(pane.id, !paneMuted) } label: {
-                            Label(paneMuted ? "Unmute this pane" : "Mute this pane", systemImage: paneMuted ? "bell" : "bell.slash")
-                        }
-                        Button { onMute(session.id, !sessionMuted) } label: {
-                            Label(sessionMuted ? "Unmute \(session.label)" : "Mute \(session.label)",
-                                  systemImage: sessionMuted ? "bell" : "bell.slash")
-                        }
-                    }
+                    ForEach(tab.panes) { row($0) }
                 }
+                if showIdle && !searching { foldRow("Hide idle panes", open: true) }
             }
             Spacer(minLength: 6)
         }
@@ -158,6 +179,39 @@ struct SessionCard: View {
 }
 
 /// An agent waiting on you, at the top of the list: what it asks, and the way to answer.
+extension SessionCard {
+    private func row(_ pane: AppModel.Pane) -> some View {
+        let paneMuted = mutedIDs.contains(pane.id)
+        return Button { onOpen(pane) } label: {
+            PaneLine(pane: pane, muted: paneMuted || sessionMuted, selected: pane.id == openPaneId)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button { onMute(pane.id, !paneMuted) } label: {
+                Label(paneMuted ? "Unmute this pane" : "Mute this pane", systemImage: paneMuted ? "bell" : "bell.slash")
+            }
+            Button { onMute(session.id, !sessionMuted) } label: {
+                Label(sessionMuted ? "Unmute \(session.label)" : "Mute \(session.label)",
+                      systemImage: sessionMuted ? "bell" : "bell.slash")
+            }
+        }
+    }
+
+    private func foldRow(_ title: String, open: Bool) -> some View {
+        Button { withAnimation(.snappy) { showIdle.toggle() } } label: {
+            HStack(spacing: 10) {
+                Image(systemName: open ? "chevron.up" : "chevron.down").font(.caption.weight(.semibold)).frame(width: 14)
+                Text(title).font(.subheadline)
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct NeedsYouCard: View {
     let pane: AppModel.Pane
     let onReply: () -> Void
@@ -168,6 +222,7 @@ struct NeedsYouCard: View {
             Rectangle().fill(Color.red).frame(width: 4)
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
+                    AgentIcon(agent: pane.agent, size: 16)
                     Text(pane.title).font(.headline).lineLimit(1)
                     Spacer(minLength: 6)
                     if let since = pane.since {
@@ -204,6 +259,9 @@ struct PaneHeader: View {
     let compact: Bool
     let onBack: () -> Void
     let onCompose: () -> Void
+    let onAttach: (AttachSource) -> Void
+
+    enum AttachSource { case photos, camera, files }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -215,6 +273,7 @@ struct PaneHeader: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     if let pane, !pane.status.isEmpty { StatusGlyph(status: pane.status) }
+                    if let pane { AgentIcon(agent: pane.agent) }
                     Text(pane?.title ?? "Pane").font(.subheadline.weight(.semibold)).lineLimit(1)
                 }
                 if let pane {
@@ -230,6 +289,18 @@ struct PaneHeader: View {
                 }
                 .buttonStyle(.bordered).controlSize(.small)
             }
+            // An image or file for the agent: Rex puts it on the pane's machine and types its path.
+            Menu {
+                Button { onAttach(.photos) } label: { Label("Photo Library", systemImage: "photo.on.rectangle") }
+                if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                    Button { onAttach(.camera) } label: { Label("Take Photo", systemImage: "camera") }
+                }
+                Button { onAttach(.files) } label: { Label("Files", systemImage: "folder") }
+            } label: {
+                Image(systemName: "paperclip").font(.system(size: 16, weight: .semibold))
+                    .frame(width: 32, height: 32).contentShape(Rectangle())
+            }
+            .accessibilityLabel("Attach")
             Button(action: onCompose) {
                 Image(systemName: "square.and.pencil").font(.system(size: 16, weight: .semibold))
                     .frame(width: 32, height: 32).contentShape(Rectangle())
@@ -401,5 +472,94 @@ struct SwipePreview: View {
         .scaleEffect(0.85 + 0.15 * progress)
         .opacity(Double(0.35 + 0.65 * progress))
         .animation(.spring(duration: 0.2), value: armed)
+    }
+}
+
+/// irex's mark drawn in SwiftUI: the app icon's prompt and cursor.
+struct AppMark: View {
+    var size: CGFloat = 88
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
+            .fill(LinearGradient(colors: [Color(red: 0.12, green: 0.16, blue: 0.27), Color(red: 0.04, green: 0.06, blue: 0.10)],
+                                 startPoint: .top, endPoint: .bottom))
+            .frame(width: size, height: size)
+            .overlay {
+                HStack(alignment: .bottom, spacing: size * 0.06) {
+                    Image(systemName: "chevron.right").font(.system(size: size * 0.42, weight: .heavy))
+                        .foregroundStyle(Color(red: 0.18, green: 0.83, blue: 0.75))
+                    RoundedRectangle(cornerRadius: size * 0.03).fill(Color(white: 0.9))
+                        .frame(width: size * 0.2, height: size * 0.09).padding(.bottom, size * 0.08)
+                }
+            }
+            .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
+    }
+}
+
+/// The first launch: what irex is, and the one thing it needs, a server to connect to.
+struct WelcomeView: View {
+    let onConnect: (String) -> Void
+    @State private var address = ""
+    @FocusState private var focused: Bool
+
+    private var valid: Bool { RexEndpoint(address) != nil }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            AppMark()
+            Text("irex").font(.system(size: 34, weight: .bold, design: .monospaced)).padding(.top, 20)
+            Text("Your Rex sessions and the agents in them, wherever you are.")
+                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .padding(.top, 6).padding(.horizontal, 32)
+            Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Rex server").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                TextField("host.tailnet.ts.net:7297", text: $address)
+                    .font(.system(.body, design: .monospaced))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                    .submitLabel(.go).focused($focused)
+                    .onSubmit { if valid { onConnect(address.trimmingCharacters(in: .whitespaces)) } }
+                    .padding(14)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                Text("A Rex server you can reach, such as one on your tailnet. Put account@ in front to connect as another account.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 24)
+            Button { onConnect(address.trimmingCharacters(in: .whitespaces)) } label: {
+                Text("Connect").font(.headline).frame(maxWidth: .infinity, minHeight: 50)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!valid)
+            .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 16)
+        }
+        .frame(maxWidth: 520)
+        .frame(maxWidth: .infinity)
+        .onAppear { focused = true }
+    }
+}
+
+/// Over the top of the terminal while an attachment goes up, and briefly once it's there.
+struct UploadNote: View {
+    @ObservedObject var stream: BlockStream
+
+    var body: some View {
+        if let note = stream.uploadNote {
+            HStack(spacing: 6) {
+                if stream.uploadFailed {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                } else if note.hasPrefix("Uploading") {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
+                Text(note).lineLimit(2)
+            }
+            .font(.footnote.weight(.medium))
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(.regularMaterial, in: Capsule())
+            .padding(.top, 8)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
     }
 }

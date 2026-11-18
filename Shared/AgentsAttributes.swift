@@ -16,6 +16,9 @@ struct AgentsAttributes: ActivityAttributes {
         var done: Int
         var items: [Item]
 
+        /// Agents counted but not given a row.
+        var more: Int { max(0, working + blocked + done - items.count) }
+
         /// "1 needs you · 2 working", or "All done".
         var headline: String {
             var parts: [String] = []

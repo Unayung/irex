@@ -1,4 +1,5 @@
 import ActivityKit
+import SwiftUI
 import UIKit
 import UserNotifications
 
@@ -118,6 +119,73 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
         req.httpMethod = "POST"
         Task { _ = try? await URLSession.shared.data(for: req) }
     }
+
+    #if DEBUG
+    /// The sample agents for a scenario: busy (one needs you), working, or done.
+    static func demoState(_ kind: String) -> AgentsAttributes.ContentState {
+        typealias Item = AgentsAttributes.ContentState.Item
+        let reviewer = Item(title: "REVIEWER", state: "blocked", detail: "Allow Bash(gh pr merge 4901)?", block: "block:demo-1")
+        let builder = Item(title: "Pluto prod agent API key", state: "working", detail: "Running the migration tests", block: "block:demo-2")
+        let parser = Item(title: "Parser refactor", state: "working", detail: "Reading src/config/loader.ts", block: "block:demo-3")
+        let done = Item(title: "Slow responses report", state: "done", detail: "Posted PR #258", block: "block:demo-4")
+        switch kind {
+        case "working": return .init(working: 2, blocked: 0, done: 1, items: [builder, parser, done])
+        case "done": return .init(working: 0, blocked: 0, done: 2, items: [done, Item(title: "Golden sample Q4", state: "done", detail: "Wrote the Notion page", block: "block:demo-5")])
+        default: return .init(working: 3, blocked: 1, done: 1, items: [reviewer, builder, parser])   // two more than shown
+        }
+    }
+
+    /// `-renderActivity YES` draws the Live Activity's views for each scenario into Documents/activity-*.png:
+    /// the lock screen, the expanded Dynamic Island, and the compact one (screenshots can't show the island).
+    func renderActivity() {
+        for kind in ["busy", "working", "done"] {
+            let state = Self.demoState(kind)
+            let sheet = VStack(spacing: 18) {
+                LockScreen(state: state)
+                    .frame(width: 370)
+                    .background(activityNavy, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack { Mark().padding(.leading, 6); Spacer(); ExpandedHeadline(state: state) }
+                    Rows(items: state.items, more: state.more).padding(.horizontal, 6)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 16)
+                .frame(width: 370)
+                .background(.black, in: RoundedRectangle(cornerRadius: 44, style: .continuous))
+                HStack {
+                    Mark()
+                    Spacer()
+                    CompactCount(state: state)
+                }
+                .padding(.horizontal, 16)
+                .frame(width: 250, height: 37)
+                .background(.black, in: Capsule())
+                .overlay { Capsule().fill(Color(white: 0.12)).frame(width: 125, height: 37) }   // where the camera sits
+            }
+            .padding(24)
+            .background(Color(white: 0.35))
+            .environment(\.colorScheme, .dark)
+            let renderer = ImageRenderer(content: sheet)
+            renderer.scale = 3
+            if let png = renderer.uiImage?.pngData() {
+                try? png.write(to: URL.documentsDirectory.appending(path: "activity-\(kind).png"))
+            }
+        }
+    }
+
+    /// `-demoActivity busy|working|done` starts a Live Activity with sample agents, to look at it in the simulator.
+    func demoActivity(_ kind: String) {
+        let state = Self.demoState(kind)
+        for a in Activity<AgentsAttributes>.activities { Task { await a.end(nil, dismissalPolicy: .immediate) } }
+        do {
+            let a = try Activity.request(attributes: AgentsAttributes(), content: .init(state: state, staleDate: nil))
+            let note = "started \(a.id) enabled=\(ActivityAuthorizationInfo().areActivitiesEnabled) count=\(Activity<AgentsAttributes>.activities.count)"
+            try? note.write(to: URL.documentsDirectory.appending(path: "demo.txt"), atomically: true, encoding: .utf8)
+        } catch {
+            let note = "failed \(error) enabled=\(ActivityAuthorizationInfo().areActivitiesEnabled)"
+            try? note.write(to: URL.documentsDirectory.appending(path: "demo.txt"), atomically: true, encoding: .utf8)
+        }
+    }
+    #endif
 
     // MARK: UNUserNotificationCenterDelegate
 

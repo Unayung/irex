@@ -365,3 +365,41 @@ struct QuickReplyView: View {
         .buttonStyle(.bordered)
     }
 }
+
+/// Beside the terminal during a sideways swipe: the pane letting go would open, or that there's none.
+struct SwipePreview: View {
+    let target: (pane: AppModel.Pane, position: Int, count: Int)?
+    let forward: Bool
+    let armed: Bool
+    let progress: CGFloat
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: forward ? (armed ? "arrow.right.circle.fill" : "arrow.right.circle")
+                                      : (armed ? "arrow.left.circle.fill" : "arrow.left.circle"))
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(target == nil ? Color.secondary : Color.accentColor)
+                .symbolEffect(.bounce, value: armed)
+            if let t = target {
+                HStack(spacing: 6) {
+                    if !t.pane.status.isEmpty { StatusGlyph(status: t.pane.status) }
+                    Text(t.pane.title).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.center)
+                }
+                Text("\(t.position) of \(t.count)").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                Text(armed ? "Release to open" : "Keep swiping").font(.caption2.weight(.medium))
+                    .foregroundStyle(armed ? Color.accentColor : .secondary)
+            } else {
+                Text(forward ? "Last pane" : "First pane").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(width: 150)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(armed ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .strokeBorder(armed ? Color.accentColor : .clear, lineWidth: 1.5))
+        .scaleEffect(0.85 + 0.15 * progress)
+        .opacity(Double(0.35 + 0.65 * progress))
+        .animation(.spring(duration: 0.2), value: armed)
+    }
+}

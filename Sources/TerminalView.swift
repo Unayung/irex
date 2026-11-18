@@ -12,7 +12,9 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     var onEdgeSwipe: (() -> Void)?
     var onEdgeHover: ((CGFloat?) -> Void)?
     var onCompose: (() -> Void)?
-    var onSwipePane: ((Int) -> Void)?            // +1 next pane, -1 previous
+    /// A sideways swipe toward another pane, as it happens, so the view can follow the finger.
+    enum PaneSwipe { case moved(CGFloat), ended(CGFloat, velocity: CGFloat), cancelled }
+    var onPaneSwipe: ((PaneSwipe) -> Void)?
     var onFontSizeChange: ((CGFloat) -> Void)?
     var onCellTap: ((Int, Int) -> Void)?         // column, row of the server's screen
     let interactive: Bool                        // false: a preview that only draws
@@ -200,13 +202,17 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
         guard let pan = g as? UIPanGestureRecognizer, pan === scrollPan || pan === panePan else { return super.gestureRecognizerShouldBegin(g) }
         let v = pan.velocity(in: self)
         let sideways = abs(v.x) > abs(v.y) * 1.5
-        return pan === panePan ? sideways && onSwipePane != nil : !sideways || onSwipePane == nil
+        return pan === panePan ? sideways && onPaneSwipe != nil : !sideways || onPaneSwipe == nil
     }
 
     @objc private func swiped(_ g: UIPanGestureRecognizer) {
-        guard g.state == .ended else { return }
-        let dx = g.translation(in: self).x
-        if abs(dx) > 70 { haptic.impactOccurred(); onSwipePane?(dx < 0 ? 1 : -1) }
+        // In the window's coordinates: this view moves with the finger, its own would chase it.
+        let dx = g.translation(in: window).x
+        switch g.state {
+        case .began, .changed: onPaneSwipe?(.moved(dx))
+        case .ended: onPaneSwipe?(.ended(dx, velocity: g.velocity(in: window).x))
+        default: onPaneSwipe?(.cancelled)
+        }
     }
 
     // MARK: selection

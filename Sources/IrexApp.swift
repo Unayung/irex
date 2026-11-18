@@ -38,11 +38,9 @@ final class AppModel: ObservableObject {
     @Published var connecting = false
     @Published var stream: BlockStream?
     @Published var openPaneId: String?
-    @Published var toast: String?
     private var controls: [String: RexControl] = [:]
     private var sessionHost: [String: String] = [:]
     private var clickedAt: [String: Date] = [:]    // block ID → when irex last clicked in it
-    private var toastTask: Task<Void, Never>?
     /// A pane a notification or the Live Activity asked for, opened as soon as its session's
     /// view arrives: on a cold start that's after connecting, listing, and fetching views.
     private var wanted: (block: String, at: Date)?
@@ -287,22 +285,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Opens the pane before or after the open one, through the session's tabs in order.
-    func openNeighbor(_ delta: Int) {
-        guard let s = stream, let session = sessions.first(where: { $0.id == s.sessionId }) else { return }
+    /// The pane before (-1) or after (+1) the open one, through the session's tabs in order.
+    func neighbor(_ delta: Int) -> (pane: Pane, position: Int, count: Int)? {
+        guard let s = stream, let session = sessions.first(where: { $0.id == s.sessionId }) else { return nil }
         let panes = session.tabs.flatMap(\.panes)
-        guard let i = panes.firstIndex(where: { $0.id == s.blockId }), panes.indices.contains(i + delta) else { return }
-        let next = panes[i + delta]
-        show("\(next.title)  \(i + delta + 1)/\(panes.count)")
-        Task { await open(next) }
+        guard let i = panes.firstIndex(where: { $0.id == s.blockId }), panes.indices.contains(i + delta) else { return nil }
+        return (panes[i + delta], i + delta + 1, panes.count)
     }
 
-    /// A short note over the terminal, such as which pane a swipe opened.
-    func show(_ text: String) {
-        toast = text
-        toastTask?.cancel()
-        toastTask = Task { try? await Task.sleep(for: .seconds(1.2)); if !Task.isCancelled { toast = nil } }
+    func openNeighbor(_ delta: Int) {
+        guard let n = neighbor(delta) else { return }
+        Task { await open(n.pane) }
     }
+
 
     func clicked(_ blockId: String) { clickedAt[blockId] = .now }
 
@@ -374,6 +369,8 @@ struct ContentView: View {
     @State private var settingsShown = false
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
+    @State private var swipeDX: CGFloat = 0        // how far the terminal follows a sideways swipe
+    @State private var swipeArmed = false          // past the point where letting go switches panes
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
@@ -448,17 +445,22 @@ struct ContentView: View {
                                           onEdgeSwipe: { if sizeClass == .compact { app.closePane() } else { columns = .all } },
                                           onEdgeHover: { _ in },
                                           onCompose: { composing = true },
-                                          onSwipePane: { app.openNeighbor($0) },
+                                          onPaneSwipe: { paneSwipe($0) },
                                           onFontSizeChange: { fontSize = $0 },
                                           onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) })
                         .id(s.blockId)
-                        .overlay {
-                            if let t = app.toast {
-                                Text(t).font(.callout.weight(.medium)).padding(.horizontal, 14).padding(.vertical, 8)
-                                    .background(.regularMaterial, in: Capsule()).transition(.opacity)
+                        .offset(x: swipeDX)
+                        .background(Color(.systemGroupedBackground))
+                        .overlay(alignment: swipeDX < 0 ? .trailing : .leading) {
+                            if swipeDX != 0 {
+                                SwipePreview(target: app.neighbor(swipeDX < 0 ? 1 : -1), forward: swipeDX < 0,
+                                             armed: swipeArmed, progress: min(1, abs(swipeDX) / Self.swipeThreshold))
+                                    .padding(.horizontal, 12)
+                                    // Comes in from the edge with the finger, settled by the threshold.
+                                    .offset(x: (swipeDX < 0 ? 1 : -1) * max(0, 174 - abs(swipeDX) * 1.9))
                             }
                         }
-                        .animation(.easeOut(duration: 0.15), value: app.toast)
+                        .clipped()
                 } else if app.opening {
                     Spacer(); ProgressView("Opening…"); Spacer()
                 } else {
@@ -499,6 +501,12 @@ struct ContentView: View {
             #if DEBUG
             // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
             if UserDefaults.standard.bool(forKey: "showSettings") { settingsShown = true }
+            // `-swipeDX <points>` (or `-swipeLeft <points>`) holds a sideways swipe that far, to look at its preview.
+            let hold = UserDefaults.standard.double(forKey: "swipeDX") - UserDefaults.standard.double(forKey: "swipeLeft")
+            if hold != 0 {
+                try? await Task.sleep(for: .seconds(5))
+                paneSwipe(.moved(hold))
+            }
             if let want = UserDefaults.standard.string(forKey: "showReply") {
                 try? await Task.sleep(for: .seconds(3))
                 replyTo = app.sessions.flatMap(\.tabs).flatMap(\.panes).first { $0.title.contains(want) }
@@ -516,6 +524,12 @@ struct ContentView: View {
             // Straight to the pane: no slide in from the list.
             var t = Transaction(); t.disablesAnimations = true
             withTransaction(t) { app.openWhenListed(id) }
+        }
+        // A pane a swipe opened comes in from the side the swipe pointed to.
+        .onChange(of: app.stream?.blockId) { _, _ in
+            guard swipeDX != 0 else { return }
+            swipeDX = -swipeDX * 0.35
+            withAnimation(.spring(duration: 0.32)) { swipeDX = 0 }
         }
         .onChange(of: app.openPaneId) { _, id in
             push.showing = id
@@ -596,6 +610,40 @@ struct SettingsView: View {
     }
 }
 
+extension ContentView {
+    static let swipeThreshold: CGFloat = 90
+
+    /// Follows a sideways swipe: the terminal moves with the finger, a card shows where letting go
+    /// leads, and past the threshold it lights up, with a tap, before anything switches.
+    func paneSwipe(_ e: TerminalView.PaneSwipe) {
+        switch e {
+        case .moved(let dx):
+            let target = app.neighbor(dx < 0 ? 1 : -1)
+            swipeDX = target == nil ? dx * 0.25 : dx      // resists at the first and last pane
+            let armed = target != nil && abs(dx) > Self.swipeThreshold
+            if armed != swipeArmed {
+                swipeArmed = armed
+                UISelectionFeedbackGenerator().selectionChanged()
+            }
+        case .ended(let dx, let velocity):
+            let delta = dx < 0 ? 1 : -1
+            let flick = abs(velocity) > 900 && abs(dx) > 30 && (velocity < 0) == (dx < 0)
+            swipeArmed = false
+            if app.neighbor(delta) != nil && (abs(dx) > Self.swipeThreshold || flick) {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                let width = UIScreen.main.bounds.width
+                withAnimation(.easeIn(duration: 0.15)) { swipeDX = dx < 0 ? -width : width }
+                Task { try? await Task.sleep(for: .milliseconds(150)); app.openNeighbor(delta) }
+            } else {
+                withAnimation(.spring(duration: 0.3)) { swipeDX = 0 }
+            }
+        case .cancelled:
+            swipeArmed = false
+            withAnimation(.spring(duration: 0.3)) { swipeDX = 0 }
+        }
+    }
+}
+
 struct TerminalRepresentable: UIViewRepresentable {
     let stream: BlockStream
     let fontSize: Double
@@ -603,7 +651,7 @@ struct TerminalRepresentable: UIViewRepresentable {
     let onEdgeSwipe: () -> Void
     let onEdgeHover: (CGFloat?) -> Void
     let onCompose: () -> Void
-    let onSwipePane: (Int) -> Void
+    let onPaneSwipe: (TerminalView.PaneSwipe) -> Void
     let onFontSizeChange: (Double) -> Void
     let onCellTap: (Int, Int) -> Void
 
@@ -616,7 +664,7 @@ struct TerminalRepresentable: UIViewRepresentable {
         v.onEdgeSwipe = onEdgeSwipe
         v.onEdgeHover = onEdgeHover
         v.onCompose = onCompose
-        v.onSwipePane = onSwipePane
+        v.onPaneSwipe = onPaneSwipe
         v.onFontSizeChange = { onFontSizeChange(Double($0)) }
         v.onCellTap = onCellTap
         Task {

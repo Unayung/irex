@@ -1,0 +1,212 @@
+import Foundation
+
+/// What just happened that might justify taking ownership of a block.
+/// Owning a block makes the server size the pty (and pick colors) for *this* client,
+/// which reflows the same pane on the Mac app or orex.
+enum ClaimTrigger {
+    case streamStart     // the pane just opened its data stream
+    case sceneActive     // irex came back to the foreground (app switch, unlock, Stage Manager focus)
+    case userTouch       // the user tapped the pane
+    case keyboardInput   // the user typed into the pane
+}
+
+/// One block's terminal stream: `data.connect` ticket → `/api/data` → snapshot → live VT.
+/// Input goes over the control socket (`terminal.write`), one request at a time.
+@MainActor
+final class BlockStream {
+    let sessionId: String
+    let blockId: String
+    let terminal: TerminalModel
+    var onEnded: ((String) -> Void)?
+
+    private let control: RexControl
+    private let session = URLSession(configuration: .default)
+    private var task: URLSessionWebSocketTask?
+
+    private enum Phase { case handshake, snapshot, live }
+    private var phase = Phase.handshake
+    private var marker = Data()
+    private var buffer = Data()
+
+    private var unsent = Data()
+    private var writing = false
+    private var wantedSize: (cols: Int, rows: Int)?
+    private var resizeTask: Task<Void, Never>?
+
+    init(control: RexControl, sessionId: String, blockId: String, terminal: TerminalModel) {
+        self.control = control; self.sessionId = sessionId; self.blockId = blockId; self.terminal = terminal
+    }
+
+    func start() async {
+        do {
+            let r = try await control.call("data.connect", ["session_id": sessionId, "block_id": blockId,
+                                                           "data_ref_id": "terminal", "subprotocol": "rex.data.terminal.v1"])
+            guard let ticket = (r["ticket"] as? String).flatMap(Self.base64url), ticket.count == 16 else {
+                throw RexError(description: "bad data ticket")
+            }
+            let ep = control.endpoint
+            let t = session.webSocketTask(with: ep.socketURL("/api/data"), protocols: ep.protocols("rex.data.terminal.v1"))
+            task = t
+            t.resume()
+            try await t.send(.data(Data([0x01]) + ticket))
+            receiveLoop(t)
+            await claim(.streamStart)
+        } catch {
+            end("\(error)")
+        }
+    }
+
+    func stop() {
+        resizeTask?.cancel()
+        let (s, b) = (sessionId, blockId)
+        Task { [control] in _ = try? await control.call("session.disown_block", ["session_id": s, "block_ids": [b]]) }
+        task?.cancel(with: .normalClosure, reason: nil)
+        task = nil
+    }
+
+    // MARK: ownership
+
+    /// Decides whether `trigger` should take this block away from whichever client owns it now.
+    func shouldClaim(_ trigger: ClaimTrigger) -> Bool {
+        // Same rule as orex: the device you're holding sizes the pty. Opening, coming back to the
+        // foreground, or tapping the pane takes it; typing doesn't, since the tap already did.
+        switch trigger {
+        case .streamStart, .sceneActive, .userTouch: return true
+        case .keyboardInput: return false
+        }
+    }
+
+    func claim(_ trigger: ClaimTrigger) async {
+        guard shouldClaim(trigger) else { return }
+        _ = try? await control.call("session.own_block", ["session_id": sessionId, "block_ids": [blockId], "mode": "take"])
+        // Another client may have changed the size while it owned the block.
+        if wantedSize != nil { sendSize() }
+    }
+
+    // MARK: size and input
+
+    /// The pane's grid changed. Debounced 120 ms like orex; the emulator itself only
+    /// resizes when the server answers with an in-band `resize`.
+    func requestSize(cols: Int, rows: Int) {
+        guard cols > 0, rows > 0 else { return }
+        wantedSize = (cols, rows)
+        resizeTask?.cancel()
+        resizeTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            if !Task.isCancelled { self?.sendSize() }
+        }
+    }
+
+    private func sendSize() {
+        guard let s = wantedSize else { return }
+        Task { _ = try? await control.call("com.superlogical.terminal.resize",
+                                           ["session_id": sessionId, "block_id": blockId, "args": ["columns": s.cols, "rows": s.rows]]) }
+    }
+
+    /// Block methods run concurrently on the server, so a second in-flight write could overtake
+    /// the first. Batch keystrokes and keep exactly one write in flight.
+    func send(_ bytes: Data) {
+        unsent.append(bytes)
+        flush()
+    }
+
+    private func flush() {
+        guard !writing, !unsent.isEmpty else { return }
+        writing = true
+        let text = String(decoding: unsent, as: UTF8.self)
+        unsent.removeAll()
+        Task {
+            _ = try? await control.call("com.superlogical.terminal.write",
+                                        ["session_id": sessionId, "block_id": blockId, "args": ["data": text]])
+            writing = false
+            flush()
+        }
+    }
+
+    // MARK: data stream
+
+    private func receiveLoop(_ t: URLSessionWebSocketTask) {
+        t.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self, t === self.task else { return }
+                switch result {
+                case .failure(let e):
+                    let reason = t.closeReason.map { String(decoding: $0, as: UTF8.self) } ?? ""
+                    self.end("\(t.closeCode.rawValue) \(reason.isEmpty ? e.localizedDescription : reason)")
+                case .success(.data(let d)):
+                    self.onBinary(d); self.receiveLoop(t)
+                case .success:
+                    self.receiveLoop(t)
+                }
+            }
+        }
+    }
+
+    private func onBinary(_ bytes: Data) {
+        if phase == .handshake {
+            let b = [UInt8](bytes)
+            guard b.count == 32, b[0] == 0x81 else {
+                return end(String(format: "data handshake rejected, reason 0x%02x", b.count > 1 ? b[1] : 0))
+            }
+            let nonce = b[24..<32].reversed().reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+            marker = Data([0x1B, 0x5F]) + Data("rex1;\(nonce);".utf8)
+            phase = .snapshot
+            return
+        }
+        buffer.append(bytes)
+        if phase == .snapshot {
+            guard let r = buffer.range(of: marker) else { return }
+            guard terminal.restoreSnapshot(buffer[buffer.startIndex..<r.lowerBound]) else {
+                return end("could not read the terminal snapshot")
+            }
+            buffer = Data(buffer[r.lowerBound...])
+            phase = .live
+        }
+        handleLive()
+    }
+
+    private func handleLive() {
+        while true {
+            guard let s = buffer.range(of: marker) else {
+                // Keep a trailing partial marker for the next message.
+                var keep = min(marker.count - 1, buffer.count)
+                while keep > 0 && !marker.starts(with: buffer.suffix(keep)) { keep -= 1 }
+                terminal.feed(buffer.dropLast(keep))
+                buffer = Data(buffer.suffix(keep))
+                return
+            }
+            if s.lowerBound > buffer.startIndex { terminal.feed(buffer[buffer.startIndex..<s.lowerBound]) }
+            guard let e = buffer.range(of: Data([0x1B, 0x5C]), in: s.upperBound..<buffer.endIndex) else {
+                buffer = Data(buffer[s.lowerBound...])
+                return
+            }
+            if let msg = (try? JSONSerialization.jsonObject(with: buffer[s.upperBound..<e.lowerBound])) as? [String: Any] {
+                handleRexMessage(msg)
+            }
+            buffer = Data(buffer[e.upperBound...])
+        }
+    }
+
+    private func handleRexMessage(_ m: [String: Any]) {
+        switch m["type"] as? String {
+        case "resize":
+            if let c = m["cols"] as? Int, let r = m["rows"] as? Int { terminal.resizeGrid(cols: c, rows: r) }
+        case "theme":
+            terminal.setTheme(m)
+        case "child_exited":
+            end("process exited (\(m["exit_code"] ?? "?"))")
+        default: break
+        }
+    }
+
+    private func end(_ reason: String) {
+        task = nil
+        onEnded?(reason)
+    }
+
+    static func base64url(_ s: String) -> Data? {
+        var b = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        b += String(repeating: "=", count: (4 - b.count % 4) % 4)
+        return Data(base64Encoded: b)
+    }
+}

@@ -1,0 +1,369 @@
+import UIKit
+import GhosttyVt
+
+/// Draws a TerminalModel and turns keyboard input into terminal bytes.
+/// Printable text arrives through UIKeyInput.insertText (so the software keyboard and IME work);
+/// special keys and Ctrl/Option chords are caught in pressesBegan and go through libghostty's encoder.
+final class TerminalView: UIView, UIKeyInput {
+    let model: TerminalModel
+    var onInput: ((Data) -> Void)?
+    var onGridSize: ((Int, Int) -> Void)?
+    var onActivate: ((ClaimTrigger) -> Void)?
+    var onEdgeSwipe: (() -> Void)?
+    var onEdgeHover: ((CGFloat?) -> Void)?
+
+    private var font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+    private(set) var fontSize: CGFloat = 14
+    private var fonts: [UIFont] = []     // regular, bold, italic, bold-italic
+    private var cw: CGFloat = 8, ch: CGFloat = 16, baseline: CGFloat = 12
+    private var grid = (cols: 0, rows: 0)
+    private var repeatTimer: Timer?
+    private var panRemainder: CGFloat = 0
+    private var ctrlArmed = false { didSet { ctrlButton?.isSelected = ctrlArmed } }
+    private weak var ctrlButton: UIButton?
+    private let haptic = UIImpactFeedbackGenerator(style: .light)
+    private lazy var keyBar = makeKeyBar()
+
+    init(model: TerminalModel) {
+        self.model = model
+        super.init(frame: .zero)
+        isOpaque = true
+        contentMode = .redraw
+        setFont(size: 14)
+        model.onChange = { [weak self] in self?.setNeedsDisplay() }
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned))
+        // ponytail: one finger scrolls; text selection will need long-press-then-drag when it lands.
+        pan.allowedScrollTypesMask = .continuous   // trackpad two-finger scroll
+        addGestureRecognizer(pan)
+        let edge = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(edgeSwiped))
+        edge.edges = .left
+        addGestureRecognizer(edge)
+        pan.require(toFail: edge)   // a swipe from the left edge opens the sidebar instead of scrolling
+        addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hovered)))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setFont(size: CGFloat) {
+        fontSize = size
+        font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        let bold = UIFont.monospacedSystemFont(ofSize: size, weight: .bold)
+        func italic(_ f: UIFont) -> UIFont { f.fontDescriptor.withSymbolicTraits(.traitItalic).map { UIFont(descriptor: $0, size: size) } ?? f }
+        fonts = [font, bold, italic(font), italic(bold)]
+        let scale = window?.screen.scale ?? 2
+        // Snap cells to device pixels so adjacent backgrounds have no seams.
+        cw = (("M" as NSString).size(withAttributes: [.font: font]).width * scale).rounded(.up) / scale
+        ch = (font.lineHeight * scale).rounded(.up) / scale
+        baseline = font.ascender + (ch - font.lineHeight) / 2
+        model.setCellSize(width: cw * scale, height: ch * scale)
+        refit()
+        setNeedsDisplay()
+    }
+
+    // The first setFont runs before there's a screen to ask; redo it at the real scale (3x on iPhone).
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { setFont(size: fontSize) }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        refit()
+    }
+
+    private func refit() {
+        let cols = Int(bounds.width / cw), rows = Int(bounds.height / ch)
+        guard cols > 0, rows > 0, (cols, rows) != grid else { return }
+        grid = (cols, rows)
+        onGridSize?(cols, rows)
+    }
+
+    // MARK: drawing
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        let f = model.frame()
+        ctx.setFillColor(f.background.cgColor)
+        ctx.fill(bounds)
+        for (y, row) in f.rows.enumerated() {
+            let top = CGFloat(y) * ch
+            for c in row where c.bg != nil {
+                ctx.setFillColor(c.bg!.cgColor)
+                ctx.fill(CGRect(x: CGFloat(c.x) * cw, y: top, width: CGFloat(c.width) * cw, height: ch))
+            }
+            drawText(row, top: top, ctx: ctx)
+        }
+        if let cur = f.cursor {
+            let r = CGRect(x: CGFloat(cur.x) * cw, y: CGFloat(cur.y) * ch, width: CGFloat(cur.width) * cw, height: ch)
+            ctx.setFillColor(f.cursorColor.cgColor)
+            ctx.setStrokeColor(f.cursorColor.cgColor)
+            switch isFirstResponder ? f.cursorStyle : GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW {
+            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: ctx.fill(CGRect(x: r.minX, y: r.minY, width: 2, height: ch))
+            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE: ctx.fill(CGRect(x: r.minX, y: r.maxY - 2, width: r.width, height: 2))
+            case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW: ctx.stroke(r.insetBy(dx: 0.5, dy: 0.5), width: 1)
+            default:
+                ctx.fill(r)
+                if let c = f.rows[cur.y].first(where: { $0.x == cur.x }), !c.text.isEmpty {
+                    draw(c.text, x: r.minX, top: r.minY, font: fonts[(c.bold ? 1 : 0) | (c.italic ? 2 : 0)], color: c.bg ?? f.background)
+                }
+            }
+        }
+    }
+
+    /// ASCII runs are drawn as one string; everything else per cell at x*cw so fallback-font
+    /// advances (CJK, emoji) can't drift off the grid.
+    private func drawText(_ row: [Cell], top: CGFloat, ctx: CGContext) {
+        var i = 0
+        while i < row.count {
+            let c = row[i]
+            guard !c.text.isEmpty else { i += 1; continue }
+            let fontIdx = (c.bold ? 1 : 0) | (c.italic ? 2 : 0)
+            let color = c.faint ? c.fg.withAlphaComponent(0.5) : c.fg
+            var text = c.text
+            var j = i + 1
+            if c.text.utf8.count == 1 {
+                while j < row.count, row[j].x == row[j - 1].x + 1, row[j].text.utf8.count == 1,
+                      row[j].fg == c.fg, row[j].bold == c.bold, row[j].italic == c.italic, row[j].faint == c.faint {
+                    text += row[j].text; j += 1
+                }
+            }
+            let x = CGFloat(c.x) * cw
+            if text.contains(where: { $0 != " " }) { draw(text, x: x, top: top, font: fonts[fontIdx], color: color) }
+            for k in i..<j where row[k].underline || row[k].strike {
+                let cx = CGFloat(row[k].x) * cw, w = CGFloat(row[k].width) * cw
+                ctx.setFillColor(color.cgColor)
+                if row[k].underline { ctx.fill(CGRect(x: cx, y: top + baseline + 2, width: w, height: 1)) }
+                if row[k].strike { ctx.fill(CGRect(x: cx, y: top + baseline - font.xHeight / 2, width: w, height: 1)) }
+            }
+            i = j
+        }
+    }
+
+    private func draw(_ s: String, x: CGFloat, top: CGFloat, font: UIFont, color: UIColor) {
+        (s as NSString).draw(at: CGPoint(x: x, y: top + baseline - font.ascender),
+                             withAttributes: [.font: font, .foregroundColor: color, .kern: 0])
+    }
+
+    // MARK: focus and gestures
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    /// Like orex: a pointer on the left 6 pt brings out the sidebar tab at its height, and moving into
+    /// the text puts it away. `.ended` is ignored: the pointer may have moved onto the tab, which says so itself.
+    @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+        guard g.state == .began || g.state == .changed else { return }
+        let p = g.location(in: self)
+        onEdgeHover?(p.x < 6 ? p.y : nil)
+    }
+
+    @objc private func edgeSwiped(_ g: UIScreenEdgePanGestureRecognizer) {
+        if g.state == .ended, g.translation(in: self).x > 60 { onEdgeSwipe?() }
+    }
+
+    @objc private func tapped() {
+        becomeFirstResponder()
+        onActivate?(.userTouch)
+    }
+
+    @objc private func panned(_ g: UIPanGestureRecognizer) {
+        // Finger moves down → content moves down → older lines, like a wheel turned up.
+        panRemainder += g.translation(in: self).y
+        g.setTranslation(.zero, in: self)
+        let lines = Int(panRemainder / ch)
+        if lines != 0 {
+            panRemainder -= CGFloat(lines) * ch
+            let bytes = model.wheel(lines: lines, at: g.location(in: self), view: bounds.size, cell: CGSize(width: cw, height: ch))
+            if !bytes.isEmpty { onInput?(bytes) }
+        }
+        if g.state == .ended { panRemainder = 0 }
+    }
+
+    // MARK: UIKeyInput (software keyboard, IME commits, plain hardware typing)
+
+    var hasText: Bool { true }
+    var autocorrectionType: UITextAutocorrectionType = .no
+    var autocapitalizationType: UITextAutocapitalizationType = .none
+    var spellCheckingType: UITextSpellCheckingType = .no
+    var smartQuotesType: UITextSmartQuotesType = .no
+    var smartDashesType: UITextSmartDashesType = .no
+    var keyboardType: UIKeyboardType = .asciiCapable
+
+    func insertText(_ text: String) {
+        // Ctrl from the key bar applies to the next letter typed.
+        if ctrlArmed, text.count == 1, let c = text.lowercased().unicodeScalars.first, ("a"..."z").contains(c) {
+            ctrlArmed = false
+            return sendKey(GhosttyKey(rawValue: GHOSTTY_KEY_A.rawValue + numericCast(c.value - 97)),
+                           mods: GhosttyMods(GHOSTTY_MODS_CTRL), text: "", unshifted: c.value)
+        }
+        ctrlArmed = false
+        if text == "\n" { return sendKey(GHOSTTY_KEY_ENTER, mods: 0, text: "", unshifted: 0) }
+        if text == "\t" { return sendKey(GHOSTTY_KEY_TAB, mods: 0, text: "", unshifted: 0) }
+        send(Data(text.utf8))   // like orex's IME commit: raw UTF-8 to the program
+    }
+
+    func deleteBackward() { sendKey(GHOSTTY_KEY_BACKSPACE, mods: 0, text: "", unshifted: 0) }
+
+    override func paste(_ sender: Any?) {
+        if let s = UIPasteboard.general.string { model.scrollToBottom(); onInput?(model.encodePaste(s)) }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        action == #selector(paste(_:)) ? UIPasteboard.general.hasStrings : super.canPerformAction(action, withSender: sender)
+    }
+
+    // MARK: key bar
+
+    /// The keys a terminal needs that the software keyboard doesn't have, above the keyboard.
+    override var inputAccessoryView: UIView? { keyBar }
+
+    private func makeKeyBar() -> UIView {
+        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 0, height: 46), inputViewStyle: .keyboard)
+        bar.allowsSelfSizing = false
+        let stack = UIStackView()
+        stack.axis = .horizontal; stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(stack)
+        bar.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: bar.topAnchor), scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8),
+            stack.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            stack.heightAnchor.constraint(equalToConstant: 34),
+        ])
+        func key(_ title: String? = nil, symbol: String? = nil, _ action: @escaping () -> Void) -> UIButton {
+            var c = UIButton.Configuration.gray()
+            c.title = title
+            c.image = symbol.map { UIImage(systemName: $0, withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)) } ?? nil
+            c.cornerStyle = .medium
+            c.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12)
+            c.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+                var a = $0; a.font = .monospacedSystemFont(ofSize: 15, weight: .medium); return a
+            }
+            let b = UIButton(configuration: c, primaryAction: UIAction { [weak self] _ in self?.haptic.impactOccurred(); action() })
+            stack.addArrangedSubview(b)
+            return b
+        }
+        // Weak: the bar belongs to this view, so a strong self here would keep both alive forever.
+        let press: (GhosttyKey, Bool) -> Void = { [weak self] k, shift in
+            guard let self else { return }
+            var mods: GhosttyMods = shift ? GhosttyMods(GHOSTTY_MODS_SHIFT) : 0
+            if self.ctrlArmed { mods |= GhosttyMods(GHOSTTY_MODS_CTRL); self.ctrlArmed = false }
+            self.sendKey(k, mods: mods, text: "", unshifted: 0)
+        }
+        _ = key("esc") { press(GHOSTTY_KEY_ESCAPE, false) }
+        let ctrl = key("ctrl") { [weak self] in self?.ctrlArmed.toggle() }
+        // Armed ctrl reads as a filled key.
+        ctrl.configurationUpdateHandler = { b in
+            var c = b.configuration
+            c?.baseBackgroundColor = b.isSelected ? b.tintColor : nil
+            c?.baseForegroundColor = b.isSelected ? .white : nil
+            b.configuration = c
+        }
+        ctrlButton = ctrl
+        _ = key("tab") { press(GHOSTTY_KEY_TAB, false) }
+        _ = key("⇧tab") { press(GHOSTTY_KEY_TAB, true) }
+        _ = key(symbol: "arrow.left") { press(GHOSTTY_KEY_ARROW_LEFT, false) }
+        _ = key(symbol: "arrow.down") { press(GHOSTTY_KEY_ARROW_DOWN, false) }
+        _ = key(symbol: "arrow.up") { press(GHOSTTY_KEY_ARROW_UP, false) }
+        _ = key(symbol: "arrow.right") { press(GHOSTTY_KEY_ARROW_RIGHT, false) }
+        for ch in ["|", "~", "/", "-", "`"] { _ = key(ch) { [weak self] in self?.insertText(ch) } }
+        _ = key(symbol: "keyboard.chevron.compact.down") { [weak self] in self?.resignFirstResponder() }
+        return bar
+    }
+
+    // MARK: hardware keyboard
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = Set<UIPress>()
+        for p in presses {
+            guard let key = p.key, let mapped = encode(key) else { unhandled.insert(p); continue }
+            send(mapped)
+            startRepeat(key)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        repeatTimer?.invalidate()
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        repeatTimer?.invalidate()
+        super.pressesCancelled(presses, with: event)
+    }
+
+    /// UIKit doesn't auto-repeat keys we consume in pressesBegan, so repeat them ourselves.
+    private func startRepeat(_ key: UIKey) {
+        repeatTimer?.invalidate()
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                if let self, let b = self.encode(key, action: GHOSTTY_KEY_ACTION_REPEAT) { self.send(b) }
+            }
+        }
+    }
+
+    /// Returns bytes for keys we handle here, or nil to let UIKit route the key to insertText/IME.
+    private func encode(_ key: UIKey, action: GhosttyKeyAction = GHOSTTY_KEY_ACTION_PRESS) -> Data? {
+        let flags = key.modifierFlags
+        // Cmd chords stay with the system (Cmd+V → paste); lone modifiers stay with UIKit's own tracking.
+        if flags.contains(.command) || Self.isModifier(key.keyCode) { return nil }
+        guard let (gkey, unshifted) = Self.hidToGhostty[key.keyCode] else { return nil }
+        let chord = flags.contains(.control) || flags.contains(.alternate)
+        if unshifted != 0 && !chord { return nil }   // plain typing: insertText keeps IME working
+        var mods: GhosttyMods = 0
+        if flags.contains(.shift) { mods |= GhosttyMods(GHOSTTY_MODS_SHIFT) }
+        if flags.contains(.control) { mods |= GhosttyMods(GHOSTTY_MODS_CTRL) }
+        // ponytail: Option acts as Meta (ESC-prefix), not as the macOS compose key.
+        if flags.contains(.alternate) { mods |= GhosttyMods(GHOSTTY_MODS_ALT) }
+        var text = ""
+        if unshifted != 0, !flags.contains(.control) {
+            text = flags.contains(.shift) ? key.charactersIgnoringModifiers.uppercased() : key.charactersIgnoringModifiers
+            if text.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F || (0xF700...0xF8FF).contains($0.value) }) { text = "" }
+        }
+        return model.encodeKey(action: action, key: gkey, mods: mods, text: text, unshifted: unshifted)
+    }
+
+    private func sendKey(_ key: GhosttyKey, mods: GhosttyMods, text: String, unshifted: UInt32) {
+        send(model.encodeKey(action: GHOSTTY_KEY_ACTION_PRESS, key: key, mods: mods, text: text, unshifted: unshifted))
+    }
+
+    private func send(_ bytes: Data) {
+        guard !bytes.isEmpty else { return }
+        onActivate?(.keyboardInput)
+        model.scrollToBottom()
+        onInput?(bytes)
+    }
+
+    private static func isModifier(_ c: UIKeyboardHIDUsage) -> Bool { (0xE0...0xE7).contains(c.rawValue) }
+
+    /// USB HID usage (page 7) → (GhosttyKey, unshifted US-layout codepoint).
+    private static let hidToGhostty: [UIKeyboardHIDUsage: (GhosttyKey, UInt32)] = {
+        func k(_ base: GhosttyKey, _ n: Int) -> GhosttyKey { GhosttyKey(rawValue: base.rawValue + numericCast(n)) }
+        var m: [UIKeyboardHIDUsage: (GhosttyKey, UInt32)] = [:]
+        func put(_ usage: Int, _ key: GhosttyKey, _ ch: Character? = nil) {
+            m[UIKeyboardHIDUsage(rawValue: usage)!] = (key, ch.map { $0.unicodeScalars.first!.value } ?? 0)
+        }
+        for i in 0..<26 { put(0x04 + i, k(GHOSTTY_KEY_A, i), Character(UnicodeScalar(UInt8(97 + i)))) }
+        for i in 1...9 { put(0x1D + i, k(GHOSTTY_KEY_DIGIT_0, i), Character("\(i)")) }
+        put(0x27, GHOSTTY_KEY_DIGIT_0, "0")
+        put(0x28, GHOSTTY_KEY_ENTER); put(0x29, GHOSTTY_KEY_ESCAPE); put(0x2A, GHOSTTY_KEY_BACKSPACE)
+        put(0x2B, GHOSTTY_KEY_TAB); put(0x2C, GHOSTTY_KEY_SPACE, " ")
+        put(0x2D, GHOSTTY_KEY_MINUS, "-"); put(0x2E, GHOSTTY_KEY_EQUAL, "="); put(0x2F, GHOSTTY_KEY_BRACKET_LEFT, "[")
+        put(0x30, GHOSTTY_KEY_BRACKET_RIGHT, "]"); put(0x31, GHOSTTY_KEY_BACKSLASH, "\\"); put(0x33, GHOSTTY_KEY_SEMICOLON, ";")
+        put(0x34, GHOSTTY_KEY_QUOTE, "'"); put(0x35, GHOSTTY_KEY_BACKQUOTE, "`"); put(0x36, GHOSTTY_KEY_COMMA, ",")
+        put(0x37, GHOSTTY_KEY_PERIOD, "."); put(0x38, GHOSTTY_KEY_SLASH, "/")
+        for i in 0..<12 { put(0x3A + i, k(GHOSTTY_KEY_F1, i)) }
+        put(0x49, GHOSTTY_KEY_INSERT); put(0x4A, GHOSTTY_KEY_HOME); put(0x4B, GHOSTTY_KEY_PAGE_UP)
+        put(0x4C, GHOSTTY_KEY_DELETE); put(0x4D, GHOSTTY_KEY_END); put(0x4E, GHOSTTY_KEY_PAGE_DOWN)
+        put(0x4F, GHOSTTY_KEY_ARROW_RIGHT); put(0x50, GHOSTTY_KEY_ARROW_LEFT)
+        put(0x51, GHOSTTY_KEY_ARROW_DOWN); put(0x52, GHOSTTY_KEY_ARROW_UP)
+        put(0x64, GHOSTTY_KEY_INTL_BACKSLASH)
+        return m
+    }()
+}

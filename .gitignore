@@ -1,0 +1,5 @@
+vendor/
+build/
+*.xcodeproj/
+Info.plist
+bin/config

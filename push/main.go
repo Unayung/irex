@@ -446,15 +446,16 @@ func (s *server) alert(p *pane, was string) {
 	if msg != "" {
 		body = title + ": " + msg
 	}
-	payload := map[string]any{
-		"aps": map[string]any{
-			"alert":              map[string]string{"title": heading, "body": body},
-			"sound":              "default",
-			"thread-id":          p.block,
-			"interruption-level": level,
-		},
-		"block": p.block,
+	aps := map[string]any{
+		"alert":              map[string]string{"title": heading, "body": body},
+		"sound":              "default",
+		"thread-id":          p.block,
+		"interruption-level": level,
 	}
+	if state == "blocked" {
+		aps["category"] = "agent.blocked" // irex shows 1, 2, and 3 to answer from the notification
+	}
+	payload := map[string]any{"aps": aps, "block": p.block, "session": p.session}
 	s.each(func(d *device) error { return s.push.send(d.Env, d.Token, "alert", 10, payload) })
 }
 

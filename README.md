@@ -41,7 +41,9 @@ session that has a few, and panes running a coding agent show its mark.
 Above the keyboard sit the keys a terminal needs that the software keyboard
 lacks: esc, ctrl (it applies to the next key), tab, shift-tab, the arrows (hold
 to repeat), and a few symbols. A hardware keyboard works as it does in any
-terminal.
+terminal, and ⌘ adds irex's own keys: ⌘[ and ⌘] for the previous and next
+pane, ⌘F to search, ⌘N for a new session, ⌘↩ to write a message, ⌘W to close
+the pane. When you scroll back, a button takes you to the latest output.
 
 When irex opens a pane, it becomes the pane's owner, so the pane takes the size
 of the screen, and other clients see it at that size until one of them takes it
@@ -58,7 +60,8 @@ irex-push, in `push/`, runs on the server's machine and watches every agent on i
 and on the hosts in its `rex hosts`. When one needs you or finishes, your phone
 gets a notification; while any are working, a Live Activity on the lock screen
 and in the Dynamic Island shows how many, the ones that need you first. Tap
-either to open the pane. irex finds irex-push on port 7298 of the server's host.
+either to open the pane, or answer a "needs you" notification with its 1, 2,
+or 3 buttons without opening irex (a locked phone asks for Face ID first). irex finds irex-push on port 7298 of the server's host.
 
 It needs an APNs key (developer.apple.com → Keys → Apple Push Notifications
 service), Go, and a way to reach it from the phone, such as Tailscale Serve:

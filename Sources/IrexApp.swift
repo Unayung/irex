@@ -11,6 +11,9 @@ struct IrexApp: App {
 
 @MainActor
 final class AppModel: ObservableObject {
+    /// One model for the app, so a notification's answer can reach it before any screen is up.
+    static let shared = AppModel()
+
     struct Pane: Identifiable {
         let id: String
         let sessionId: String
@@ -323,6 +326,17 @@ final class AppModel: ObservableObject {
 
     func clicked(_ blockId: String) { clickedAt[blockId] = .now }
 
+    /// Types `key` into a pane without opening it: the answer to a notification's question.
+    /// irex may have just been woken in the background, so it connects first if it must.
+    func answer(_ block: String, key: String, server: String) async {
+        if isIdle, !server.isEmpty { await connect(server) }
+        // The pane is known once its session's view arrives, a moment after connecting.
+        for _ in 0..<40 where pane(block) == nil { try? await Task.sleep(for: .milliseconds(250)) }
+        guard let p = pane(block), let c = control(for: p.sessionId) else { return }
+        _ = try? await c.call("com.superlogical.terminal.write",
+                              ["session_id": p.sessionId, "block_id": block, "args": ["data": key]])
+    }
+
     /// Goes to the pane's screen right away, the terminal showing once the pane is known.
     func openWhenListed(_ block: String) {
         wanted = (block, .now)
@@ -371,6 +385,9 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// On iPhone the list and the pane share the screen, so searching the list leaves the pane.
+    func closePaneIfCompact(_ compact: Bool) { if compact { closePane() } }
+
     /// Stops streaming, which gives the pane's size back to the other clients.
     func closePane() {
         stream?.stop(); stream = nil
@@ -379,7 +396,7 @@ final class AppModel: ObservableObject {
 }
 
 struct ContentView: View {
-    @StateObject private var app = AppModel()
+    @ObservedObject private var app = AppModel.shared
     @ObservedObject private var push = Push.shared
     @AppStorage("server") private var server = ""
     @AppStorage("fontSize") private var fontSize = 14.0
@@ -397,6 +414,8 @@ struct ContentView: View {
     @State private var cameraShown = false
     @State private var filesShown = false
     @State private var welcome = false
+    @State private var searching = false
+    @State private var scrolledBack = false     // the open pane shows its history, not the live screen
     @State private var swipeDX: CGFloat = 0        // how far the terminal follows a sideways swipe
     @State private var swipeArmed = false          // past the point where letting go switches panes
 
@@ -454,7 +473,8 @@ struct ContentView: View {
                 .animation(.default, value: app.sessions.flatMap(\.tabs).flatMap(\.panes).map(\.status))
             }
             .background(Color(.systemGroupedBackground))
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Panes and sessions")
+            .searchable(text: $query, isPresented: $searching, placement: .navigationBarDrawer(displayMode: .automatic),
+                        prompt: "Panes and sessions")
             .overlay {
                 if app.connecting && app.sessions.isEmpty {
                     ProgressView("Connecting…")
@@ -515,6 +535,7 @@ struct ContentView: View {
                                           onPaneSwipe: { paneSwipe($0) },
                                           onFontSizeChange: { fontSize = $0 },
                                           onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) },
+                                          onScrolledBack: { scrolledBack = $0 },
                                           onPasteImage: { image in
                                               if let a = Attachments.screenshot(image, name: "pasted-" + Attachments.stamp(0, of: 1)) {
                                                   Task { await s.attach([a]) }
@@ -534,6 +555,21 @@ struct ContentView: View {
                         }
                         .clipped()
                         .overlay(alignment: .top) { UploadNote(stream: s) }
+                        .overlay(alignment: .bottomTrailing) {
+                            if scrolledBack {
+                                // Back to what the program is doing now.
+                                Button { s.terminal.scrollToBottom() } label: {
+                                    Image(systemName: "arrow.down.to.line").font(.system(size: 15, weight: .semibold))
+                                        .frame(width: 40, height: 40)
+                                }
+                                .background(.regularMaterial, in: Circle())
+                                .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
+                                .padding(14)
+                                .transition(.scale.combined(with: .opacity))
+                                .accessibilityLabel("Jump to the latest output")
+                            }
+                        }
+                        .animation(.snappy, value: scrolledBack)
                         .animation(.snappy, value: s.uploadNote)
                 } else if app.opening {
                     Spacer(); ProgressView("Opening…"); Spacer()
@@ -555,6 +591,7 @@ struct ContentView: View {
         .sheet(isPresented: $composing) {
             if let s = app.stream { ComposeView(stream: s).presentationDetents([.medium, .large]) }
         }
+        .background { shortcuts }
         .photosPicker(isPresented: $photosShown, selection: $photoItems, maxSelectionCount: 5, matching: .images)
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty, let s = app.stream else { return }
@@ -639,6 +676,7 @@ struct ContentView: View {
         }
         // A pane a swipe opened comes in from the side the swipe pointed to.
         .onChange(of: app.stream?.blockId) { _, _ in
+            scrolledBack = false
             guard swipeDX != 0 else { return }
             swipeDX = -swipeDX * 0.35
             withAnimation(.spring(duration: 0.32)) { swipeDX = 0 }
@@ -725,6 +763,24 @@ struct SettingsView: View {
 extension ContentView {
     static let swipeThreshold: CGFloat = 90
 
+    /// Keys for a hardware keyboard, listed in the overlay iPadOS shows while ⌘ is held.
+    var shortcuts: some View {
+        Group {
+            Button("Next Pane") { app.openNeighbor(1) }.keyboardShortcut("]", modifiers: .command)
+            Button("Previous Pane") { app.openNeighbor(-1) }.keyboardShortcut("[", modifiers: .command)
+            Button("Search") { columns = .all; app.closePaneIfCompact(sizeClass == .compact); searching = true }
+                .keyboardShortcut("f", modifiers: .command)
+            Button("New Session") { Task { await app.newSession() } }.keyboardShortcut("n", modifiers: .command)
+            Button("Write a Message") { if app.stream != nil { composing = true } }.keyboardShortcut(.return, modifiers: .command)
+            Button("Attach a Photo") { if app.stream != nil { photosShown = true } }.keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Close Pane") { app.closePane() }.keyboardShortcut("w", modifiers: .command)
+            Button("Settings") { settingsShown = true }.keyboardShortcut(",", modifiers: .command)
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     /// Sessions whose name matches the search, whole; otherwise the panes that match, by title or activity.
     func filtered(_ sessions: [AppModel.Session]) -> [AppModel.Session] {
         let q = query.trimmingCharacters(in: .whitespaces)
@@ -780,6 +836,7 @@ struct TerminalRepresentable: UIViewRepresentable {
     let onPaneSwipe: (TerminalView.PaneSwipe) -> Void
     let onFontSizeChange: (Double) -> Void
     let onCellTap: (Int, Int) -> Void
+    let onScrolledBack: (Bool) -> Void
     let onPasteImage: (UIImage) -> Void
 
     func makeUIView(context: Context) -> TerminalView {
@@ -795,6 +852,7 @@ struct TerminalRepresentable: UIViewRepresentable {
         v.onFontSizeChange = { onFontSizeChange(Double($0)) }
         v.onCellTap = onCellTap
         v.onPasteImage = onPasteImage
+        v.onScrolledBack = onScrolledBack
         Task {
             await stream.start()
             // iPad: ready for a hardware keyboard. iPhone: watch first; tap to bring up the keyboard.

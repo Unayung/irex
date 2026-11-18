@@ -18,6 +18,8 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     var onFontSizeChange: ((CGFloat) -> Void)?
     var onCellTap: ((Int, Int) -> Void)?         // column, row of the server's screen
     var onPasteImage: ((UIImage) -> Void)?       // pasting an image attaches it instead
+    var onScrolledBack: ((Bool) -> Void)?        // whether the view shows scrollback rather than the live screen
+    private var scrolledBack = false
     let interactive: Bool                        // false: a preview that only draws
 
     private var font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
@@ -48,7 +50,12 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
         isOpaque = true
         contentMode = .redraw
         setFont(size: 14)
-        model.onChange = { [weak self] in self?.setNeedsDisplay() }
+        model.onChange = { [weak self] in
+            guard let self else { return }
+            setNeedsDisplay()
+            let back = !model.atBottom
+            if back != scrolledBack { scrolledBack = back; onScrolledBack?(back) }
+        }
         guard interactive else { isUserInteractionEnabled = false; return }
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         // Up and down scrolls; sideways moves to the next or previous pane.

@@ -195,8 +195,25 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
         return block != nil && block == showing ? [] : [.banner, .sound, .list]
     }
 
+    /// The answers a "Needs you" notification offers, as Claude Code numbers them. They type into a
+    /// terminal, so a locked phone asks for Face ID first.
+    static func registerActions() {
+        let answers = [("1", "1 · Yes"), ("2", "2 · Yes, don't ask again"), ("3", "3 · No")].map { key, title in
+            UNNotificationAction(identifier: "reply.\(key)", title: title, options: [.authenticationRequired])
+        }
+        let blocked = UNNotificationCategory(identifier: "agent.blocked", actions: answers, intentIdentifiers: [], options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([blocked])
+    }
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        if let block = response.notification.request.content.userInfo["block"] as? String { pendingBlock = block }
+        guard let block = response.notification.request.content.userInfo["block"] as? String else { return }
+        if response.actionIdentifier.hasPrefix("reply.") {
+            // Answered from the notification: type it in and stay out of the way.
+            let key = String(response.actionIdentifier.dropFirst("reply.".count))
+            await AppModel.shared.answer(block, key: key, server: UserDefaults.standard.string(forKey: "server") ?? "")
+        } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            pendingBlock = block
+        }
     }
 
     /// irex://pane/<block ID>, from the Live Activity.
@@ -211,6 +228,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         // Set before launch finishes, so tapping a notification that launched irex still lands.
         UNUserNotificationCenter.current().delegate = Push.shared
+        Push.registerActions()
         return true
     }
 

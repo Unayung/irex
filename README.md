@@ -47,6 +47,26 @@ resizes a pane.
 Settings hold the server, the hosts, text size, fitting, and keeping the screen
 on while a pane is open.
 
+## Notifications and the Live Activity
+
+irex-push, in `push/`, runs on the server's machine and watches every agent on it
+and on the hosts in its `rex hosts`. When one needs you or finishes, your phone
+gets a notification; while any are working, a Live Activity on the lock screen
+and in the Dynamic Island shows how many, the ones that need you first. Tap
+either to open the pane. irex finds irex-push on port 7298 of the server's host.
+
+It needs an APNs key (developer.apple.com → Keys → Apple Push Notifications
+service), Go, and a way to reach it from the phone, such as Tailscale Serve:
+
+```sh
+cd push && go build -o ~/.local/bin/irex-push .
+mkdir -p ~/.config/irex-push && cp env.example ~/.config/irex-push/env   # then fill it in
+cp irex-push.service ~/.config/systemd/user/ && systemctl --user enable --now irex-push
+sudo tailscale serve --bg --https=7298 http://127.0.0.1:7298
+```
+
+Settings → Notifications in irex shows whether it's registered and sends a test.
+
 ## Build
 
 irex builds on a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
@@ -73,7 +93,7 @@ listed in `rex hosts`.
 
 ## Not yet
 
-Split layouts (a pane opens on its own), notifications, and file upload.
+Split layouts (a pane opens on its own), answering from a notification, and file upload.
 
 ## License
 

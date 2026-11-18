@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct IrexApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
         WindowGroup { ContentView() }
     }
@@ -32,6 +33,9 @@ final class AppModel: ObservableObject {
     private var sessionHost: [String: String] = [:]
     private var clickedAt: [String: Date] = [:]    // block ID → when irex last clicked in it
     private var toastTask: Task<Void, Never>?
+    /// A pane a notification or the Live Activity asked for, opened as soon as its session's
+    /// view arrives: on a cold start that's after connecting, listing, and fetching views.
+    private var wanted: (block: String, at: Date)?
 
     /// Sessions, their tabs, and each tab's panes, host by host in the server's order.
     var sessions: [Session] {
@@ -150,6 +154,8 @@ final class AppModel: ObservableObject {
 
     func disconnect() {
         closePane()
+        // Reconnecting on the way to a pane keeps you on its screen.
+        if let w = wanted { openPaneId = w.block }
         for c in controls.values { c.onClose = nil; c.close() }
         controls = [:]
         connected = false
@@ -217,6 +223,7 @@ final class AppModel: ObservableObject {
         // Views can arrive out of order; keep the newest.
         if let old = views[sessionId]?["revision"] as? Int, let new = view["revision"] as? Int, new < old { return }
         views[sessionId] = view
+        openWanted()
         for w in view["windows"] as? [[String: Any]] ?? [] {
             for l in w["layers"] as? [[String: Any]] ?? [] {
                 for b in l["blocks"] as? [[String: Any]] ?? [] {
@@ -272,6 +279,32 @@ final class AppModel: ObservableObject {
 
     func clicked(_ blockId: String) { clickedAt[blockId] = .now }
 
+    /// Goes to the pane's screen right away, the terminal showing once the pane is known.
+    func openWhenListed(_ block: String) {
+        wanted = (block, .now)
+        if stream?.blockId != block { stream?.stop(); stream = nil }
+        openPaneId = block   // the iPhone pushes the pane's screen now, not after connecting
+        openWanted()
+        Task {
+            try? await Task.sleep(for: .seconds(30))
+            guard wanted?.block == block else { return }
+            wanted = nil
+            if stream == nil && openPaneId == block { openPaneId = nil; status = "That pane is no longer there." }
+        }
+    }
+
+    /// The pane irex is waiting to open, if any.
+    var opening: Bool { wanted != nil && stream == nil }
+
+    private func openWanted() {
+        guard let w = wanted else { return }
+        // A pane that never shows up (closed meanwhile) shouldn't open by surprise later.
+        guard Date.now.timeIntervalSince(w.at) < 30 else { return }
+        guard let p = pane(w.block) else { return }
+        wanted = nil
+        Task { await open(p) }
+    }
+
     /// A stream that only watches a pane, for previews; the caller stops it.
     func watch(_ p: Pane) -> BlockStream? {
         guard let c = control(for: p.sessionId) else { return nil }
@@ -303,6 +336,7 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var app = AppModel()
+    @ObservedObject private var push = Push.shared
     @AppStorage("server") private var server = ""
     @AppStorage("fontSize") private var fontSize = 14.0
     @AppStorage("keepAwake") private var keepAwake = true
@@ -397,6 +431,8 @@ struct ContentView: View {
                             }
                         }
                         .animation(.easeOut(duration: 0.15), value: app.toast)
+                } else if app.opening {
+                    Spacer(); ProgressView("Opening…"); Spacer()
                 } else {
                     Spacer(); Text(app.sessions.isEmpty ? "Connect to a Rex server" : "Pick a pane").foregroundStyle(.secondary); Spacer()
                 }
@@ -442,7 +478,28 @@ struct ContentView: View {
         // Watching an agent work shouldn't lock the phone.
         .onChange(of: keepAwake && app.stream != nil, initial: true) { _, on in UIApplication.shared.isIdleTimerDisabled = on }
         // First launch: nothing to connect to yet, so ask for the server.
-        .task { if server.isEmpty { settingsShown = true } else { await app.connect(server) } }
+        .task {
+            #if DEBUG
+            // `-openBlock <ID>` at launch takes the path a tapped notification takes, before connecting.
+            if let id = UserDefaults.standard.string(forKey: "openBlock") { push.pendingBlock = id }
+            #endif
+            if server.isEmpty { settingsShown = true; return }
+            push.start(server: server)
+            await app.connect(server)
+        }
+        .onChange(of: server) { _, s in if !s.isEmpty { push.start(server: s) } }
+        // A notification or the Live Activity asked for a pane: open it once the list has it.
+        .onOpenURL { push.open($0) }
+        .onChange(of: push.pendingBlock, initial: true) { _, id in
+            guard let id else { return }
+            push.pendingBlock = nil
+            // Close whatever sheet is up, so the pane itself is what you see.
+            replyTo = nil; composing = false; settingsShown = false
+            // Straight to the pane: no slide in from the list.
+            var t = Transaction(); t.disablesAnimations = true
+            withTransaction(t) { app.openWhenListed(id) }
+        }
+        .onChange(of: app.openPaneId) { _, id in push.showing = id }
         .onChange(of: phase) { _, p in
             guard p == .active else { return }
             // iOS drops sockets in the background; come back connected.
@@ -505,6 +562,14 @@ struct SettingsView: View {
                     Text("Server")
                 } footer: {
                     Text("A Rex server, such as host.tailnet.ts.net:7297. Put account@ in front to connect as another account.")
+                }
+                Section {
+                    LabeledContent("Status", value: Push.shared.state)
+                    Button("Send a test notification") { Push.shared.test() }
+                } header: {
+                    Text("Notifications")
+                } footer: {
+                    Text("They come from irex-push on the server's machine: when an agent needs you or finishes, and a Live Activity with every agent on the lock screen and in the Dynamic Island.")
                 }
                 if app.hosts.count > 1 {
                     Section {

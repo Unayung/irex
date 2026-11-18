@@ -3,3 +3,5 @@ build/
 *.xcodeproj/
 Info.plist
 bin/config
+Irex.entitlements
+Widgets.plist

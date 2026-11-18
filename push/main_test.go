@@ -1,0 +1,62 @@
+package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"math/big"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestJWTVerifies(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	a := &apns{cfg: config{keyID: "KEY123", teamID: "TEAM123"}, key: key}
+	jwt, err := a.token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		t.Fatalf("want 3 parts, got %d", len(parts))
+	}
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	r, s := new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])
+	if len(sig) != 64 || !ecdsa.Verify(&key.PublicKey, sum[:], r, s) {
+		t.Fatal("signature doesn't verify as raw r||s")
+	}
+	if again, _ := a.token(); again != jwt {
+		t.Fatal("token should be reused within the hour")
+	}
+}
+
+func TestSummaryPutsBlockedFirst(t *testing.T) {
+	now := time.Now()
+	s := &server{panes: map[string]*pane{
+		"a": {block: "a", title: "old done", state: "done", changed: now.Add(-time.Hour)},
+		"b": {block: "b", title: "working", state: "working", changed: now},
+		"c": {block: "c", title: "blocked", state: "blocked", changed: now.Add(-time.Minute)},
+		"d": {block: "d", title: "idle", state: "", changed: now},
+		"e": {block: "e", title: "just done", state: "done", changed: now},
+	}}
+	c := s.summary()
+	if c.Working != 1 || c.Blocked != 1 || c.Done != 1 {
+		t.Fatalf("counts: %+v", c)
+	}
+	if len(c.Items) != 3 || c.Items[0].Title != "blocked" || c.Items[1].Title != "working" || c.Items[2].Title != "just done" {
+		t.Fatalf("order: %+v", c.Items)
+	}
+	if headline(c) != "1 needs you · 1 working" {
+		t.Fatalf("headline: %q", headline(c))
+	}
+}
+
+func TestHexToken(t *testing.T) {
+	if !hexToken(strings.Repeat("ab", 32)) || hexToken("xyz") || hexToken(strings.Repeat("g", 64)) {
+		t.Fatal("hexToken")
+	}
+}

@@ -9,8 +9,10 @@ case "${1:-ipad}" in
 esac
 rsync -a --delete --exclude .git --exclude vendor --exclude build --exclude '*.xcodeproj' --exclude Info.plist --exclude bin/config "$(dirname "$0")/../" "$MAC:Projects/irex/"
 ssh -o BatchMode=yes $MAC 'rm -f /tmp/irex-build.log; export PATH=/opt/homebrew/bin:$PATH; cd Projects/irex && xcodegen -q' 2>/dev/null
+# An App Store Connect API key lets xcodebuild make the profiles push needs without an Xcode login.
+AUTH=${ASC_KEY_ID:+-authenticationKeyPath $ASC_KEY_PATH -authenticationKeyID $ASC_KEY_ID -authenticationKeyIssuerID $ASC_ISSUER_ID}
 MAC_HOME=$(ssh -o BatchMode=yes "$MAC" 'echo $HOME')
-rex -S "$REX_HOST" new irex-build -c "$MAC_HOME/Projects/irex" -- sh -c "export PATH=/opt/homebrew/bin:\$PATH; xcodebuild -scheme Irex -destination generic/platform=iOS -derivedDataPath build -allowProvisioningUpdates DEVELOPMENT_TEAM=$TEAM -quiet build > /tmp/irex-build.log 2>&1; echo \"exit=\$?\" >> /tmp/irex-build.log" >/dev/null
+rex -S "$REX_HOST" new irex-build -c "$MAC_HOME/Projects/irex" -- sh -c "export PATH=/opt/homebrew/bin:\$PATH; xcodebuild -scheme Irex -destination generic/platform=iOS -derivedDataPath build -allowProvisioningUpdates $AUTH DEVELOPMENT_TEAM=$TEAM -quiet build > /tmp/irex-build.log 2>&1; echo \"exit=\$?\" >> /tmp/irex-build.log" >/dev/null
 until ssh -o BatchMode=yes $MAC 'grep -q ^exit= /tmp/irex-build.log' 2>/dev/null; do sleep 3; done
 ssh -o BatchMode=yes $MAC "grep -E 'error|exit=' /tmp/irex-build.log; grep -q '^exit=0' /tmp/irex-build.log && \
   xcrun devicectl device install app --device $DEVICE Projects/irex/build/Build/Products/Debug-iphoneos/Irex.app >/dev/null && \

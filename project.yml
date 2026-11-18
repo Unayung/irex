@@ -16,8 +16,14 @@ targets:
   Irex:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources: [Sources, Shared]
+    entitlements:
+      path: Irex.entitlements
+      properties:
+        aps-environment: development
+        com.apple.developer.usernotifications.time-sensitive: true
     dependencies:
+      - target: IrexWidgets
       # ponytail: 只放在 Mac 上的 vendor/，由 bin/build 從 ~/build/ghostty 複製；不進版控。
       - framework: vendor/ghostty-vt.xcframework
         embed: false
@@ -25,7 +31,23 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: irex
+        NSSupportsLiveActivities: true
+        CFBundleURLTypes: [{CFBundleURLName: io.github.unayung.Irex, CFBundleURLSchemes: [irex]}]
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations~iphone: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+  IrexWidgets:
+    # The Live Activity on the lock screen and in the Dynamic Island.
+    type: app-extension
+    platform: iOS
+    sources: [Widgets, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.unayung.Irex.Widgets
+    info:
+      path: Widgets.plist
+      properties:
+        CFBundleDisplayName: irex
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

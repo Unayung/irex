@@ -4,3 +4,7 @@ REX_HOST=mac                     # that Mac's label in `rex hosts`, for building
 TEAM=ABCDE12345                  # Apple developer team ID for signing
 IPAD=00008101-000000000000000E   # `xcrun devicectl list devices` on the Mac
 IPHONE=00008140-000000000000000E
+# App Store Connect API key (Admin), so builds can make profiles with push. The .p8 path is on the Mac.
+ASC_KEY_ID=ABC123DEFG
+ASC_ISSUER_ID=00000000-0000-0000-0000-000000000000
+ASC_KEY_PATH=/Users/you/.appstoreconnect/private_keys/AuthKey_ABC123DEFG.p8

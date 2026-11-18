@@ -172,6 +172,25 @@ final class TerminalModel {
         return Data(bytes: out, count: written)
     }
 
+    var enterKey: Data { encodeKey(action: GHOSTTY_KEY_ACTION_PRESS, key: GHOSTTY_KEY_ENTER, mods: 0, text: "", unshifted: 0) }
+    var escapeKey: Data { encodeKey(action: GHOSTTY_KEY_ACTION_PRESS, key: GHOSTTY_KEY_ESCAPE, mods: 0, text: "", unshifted: 0) }
+
+    /// The last `n` lines of the screen that have text, trailing spaces trimmed, for previews.
+    func lastLines(_ n: Int) -> [String] {
+        var lines = frame().rows.map { row in
+            String(row.map { $0.text.isEmpty ? " " : $0.text }.joined().reversed().drop(while: { $0 == " " }).reversed())
+        }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return Array(lines.suffix(n))
+    }
+
+    /// Whether the view shows the live screen rather than scrollback.
+    var atBottom: Bool {
+        var live = true
+        ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &live)
+        return live
+    }
+
     func scrollToBottom() {
         var atBottom = true
         ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &atBottom)

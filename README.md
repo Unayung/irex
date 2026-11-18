@@ -20,22 +20,32 @@ The first launch asks for a server: a Rex server's address, such as
 `host.tailnet.ts.net:7297` for one on your tailnet. Put `account@` in front to
 connect as another account.
 
-The list shows each session with its tabs and panes. A pane's dot pulses while an
-agent works in it, turns green when it's done, and reads "Needs you" when it's
-waiting on you; the line under the title counts them. Tap a pane to open it, and
-the button in its corner (or a swipe from the left edge) to go back. + starts a
-new session with a shell.
+The list shows each session with its tabs and panes, on the server and on the
+other hosts in its `rex hosts`. A pane's dot pulses while an agent works in it
+and turns green when it's done; the line under the title counts them. When an
+agent is waiting on you, its pane gets a Reply button: it shows the end of the
+question with 1, 2, 3, Esc, and Enter, so you can answer without opening the
+pane. + starts a new session with a shell.
+
+Tap a pane to open it, and the button in its corner (or a swipe from the left
+edge) to go back. Swipe sideways to go to the session's next or previous pane.
+Long-press and drag to select and copy, pinch to change the text size, and tap
+a link a program marks (OSC 8) to open it. The pencil opens a box for a longer
+message, with dictation, sent as one paste.
 
 Above the keyboard sit the keys a terminal needs that the software keyboard
-lacks: esc, ctrl (it applies to the next key), tab, shift-tab, the arrows, and a
-few symbols. A hardware keyboard works as it does in any terminal.
+lacks: esc, ctrl (it applies to the next key), tab, shift-tab, the arrows (hold
+to repeat), and a few symbols. A hardware keyboard works as it does in any
+terminal.
 
-When irex shows a pane, it becomes the pane's owner, so the pane takes the size
-of the phone's screen, and other clients see it at that size until one of them
-takes it back.
+When irex opens a pane, it becomes the pane's owner, so the pane takes the size
+of the screen, and other clients see it at that size until one of them takes it
+back; then Fit takes it again. Turn off "Fit panes to this screen" to watch
+panes at their own size instead, until you type. Replying from the list never
+resizes a pane.
 
-Settings hold the server, text size, and keeping the screen on while a pane is
-open.
+Settings hold the server, the hosts, text size, fitting, and keeping the screen
+on while a pane is open.
 
 ## Build
 
@@ -63,7 +73,7 @@ listed in `rex hosts`.
 
 ## Not yet
 
-Split layouts (a pane opens on its own), text selection, links, and file upload.
+Split layouts (a pane opens on its own), notifications, and file upload.
 
 ## License
 

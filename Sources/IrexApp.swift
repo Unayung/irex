@@ -11,9 +11,14 @@ struct IrexApp: App {
 final class AppModel: ObservableObject {
     struct Pane: Identifiable { let id: String; let sessionId: String; let title: String; let status: String }
     struct Tab: Identifiable { let id: String; let label: String; let panes: [Pane] }
-    struct Session: Identifiable { let id: String; let label: String; let tabs: [Tab] }
+    struct Session: Identifiable { let id: String; let label: String; let host: String?; let tabs: [Tab] }
+    struct HostState: Identifiable { let id: String; let label: String; let state: String }
 
-    @Published private var sessionList: [(id: String, label: String)] = []
+    /// Hosts in order: the server you connect to ("local"), then the ones its `rex hosts` lists.
+    @Published private var hostOrder: [String] = []
+    @Published private var hostLabels: [String: String] = [:]
+    @Published private var hostSessions: [String: [(id: String, label: String)]] = [:]
+    @Published private var hostProblems: [String: String] = [:]
     @Published private var views: [String: [String: Any]] = [:]     // session.view by session ID
     @Published private var titles: [String: String] = [:]           // block ID → title the program set
     @Published private var statuses: [String: String] = [:]         // block ID → working / blocked / done
@@ -22,20 +27,33 @@ final class AppModel: ObservableObject {
     @Published var connecting = false
     @Published var stream: BlockStream?
     @Published var openPaneId: String?
-    private var control: RexControl?
+    @Published var toast: String?
+    private var controls: [String: RexControl] = [:]
+    private var sessionHost: [String: String] = [:]
+    private var clickedAt: [String: Date] = [:]    // block ID → when irex last clicked in it
+    private var toastTask: Task<Void, Never>?
 
-    /// Sessions, their tabs, and each tab's panes, in the server's order.
+    /// Sessions, their tabs, and each tab's panes, host by host in the server's order.
     var sessions: [Session] {
-        sessionList.map { s in
-            let windows = views[s.id]?["windows"] as? [[String: Any]] ?? []
-            return Session(id: s.id, label: s.label, tabs: windows.map { w in
-                let blocks = (w["layers"] as? [[String: Any]] ?? []).flatMap { $0["blocks"] as? [[String: Any]] ?? [] }
-                return Tab(id: w["window_id"] as? String ?? "", label: w["label"] as? String ?? "", panes: blocks.compactMap { b in
-                    guard let id = b["block_id"] as? String else { return nil }
-                    let title = titles[id].flatMap { $0.isEmpty ? nil : $0 } ?? b["label"] as? String ?? "Pane"
-                    return Pane(id: id, sessionId: s.id, title: title, status: statuses[id] ?? "")
+        hostOrder.flatMap { host in
+            (hostSessions[host] ?? []).map { s in
+                let windows = views[s.id]?["windows"] as? [[String: Any]] ?? []
+                return Session(id: s.id, label: s.label, host: host == "local" ? nil : hostLabels[host], tabs: windows.map { w in
+                    let blocks = (w["layers"] as? [[String: Any]] ?? []).flatMap { $0["blocks"] as? [[String: Any]] ?? [] }
+                    return Tab(id: w["window_id"] as? String ?? "", label: w["label"] as? String ?? "", panes: blocks.compactMap { b in
+                        guard let id = b["block_id"] as? String else { return nil }
+                        let title = titles[id].flatMap { $0.isEmpty ? nil : $0 } ?? b["label"] as? String ?? "Pane"
+                        return Pane(id: id, sessionId: s.id, title: title, status: statuses[id] ?? "")
+                    })
                 })
-            })
+            }
+        }
+    }
+
+    var hosts: [HostState] {
+        hostOrder.map { key in
+            let state = hostProblems[key] ?? (controls[key] != nil && hostSessions[key] != nil ? "Connected" : "Connecting…")
+            return HostState(id: key, label: key == "local" ? "This server" : hostLabels[key] ?? key, state: state)
         }
     }
 
@@ -52,56 +70,113 @@ final class AppModel: ObservableObject {
         sessions.lazy.flatMap(\.tabs).flatMap(\.panes).first { $0.id == id }
     }
 
+    private func control(for sessionId: String) -> RexControl? { sessionHost[sessionId].flatMap { controls[$0] } }
+
+    // MARK: connecting
+
     func connect(_ address: String) async {
         disconnect()
         guard let ep = RexEndpoint(address) else { status = "That isn't a server address."; return }
-        let c = RexControl(endpoint: ep)
-        c.onClose = { [weak self] reason in
-            self?.status = "Disconnected: \(reason)"
-            self?.connected = false; self?.stream = nil; self?.openPaneId = nil
-            self?.control = nil; self?.sessionList = []
-        }
-        c.onEvent = { [weak self] type, payload in self?.handle(type, payload) }
-        control = c
         status = ""
         connecting = true
-        defer { if control === c || control == nil { connecting = false } }
+        hostOrder = ["local"]
+        let ok = await connectHost("local", endpoint: ep)
+        connecting = false
+        guard ok else { return }
+        connected = true
+        await refreshHosts()
+        #if DEBUG
+        // `-openPane <title>` at launch opens the first pane whose title has it, for simulator checks.
+        if let want = UserDefaults.standard.string(forKey: "openPane") {
+            try? await Task.sleep(for: .seconds(2))
+            if let p = sessions.flatMap(\.tabs).flatMap(\.panes).first(where: { $0.title.contains(want) }) { await open(p) }
+        }
+        #endif
+    }
+
+    /// Connects one host and lists its sessions. The first host's failure is the app's; others just mark their row.
+    @discardableResult
+    private func connectHost(_ key: String, endpoint: RexEndpoint) async -> Bool {
+        let c = RexControl(endpoint: endpoint)
+        c.onClose = { [weak self] reason in self?.hostClosed(key, reason) }
+        c.onEvent = { [weak self] type, payload in self?.handle(key, type, payload) }
+        controls[key] = c
+        hostProblems[key] = nil
         do {
             try await c.connect()
             // "all" brings every session's block events too: titles and statuses for the list.
             let r = try await c.call("session.attach_all", ["event_scope": "all"])
-            connected = true
-            status = ""
-            setSessions(r)
+            guard controls[key] === c else { return false }
+            setSessions(key, r)
+            return true
         } catch {
-            // A newer connect() cancels this one (-999); don't let it overwrite that attempt's status.
-            if control === c { status = "\(error)"; control = nil }
+            // A newer connect() cancels this one (-999); don't let it overwrite that attempt's state.
+            guard controls[key] === c else { return false }
+            controls[key] = nil
+            if key == "local" { status = "\(error)" } else { hostProblems[key] = "\(error)" }
+            return false
         }
+    }
+
+    private func hostClosed(_ key: String, _ reason: String) {
+        controls[key] = nil
+        if let open = stream?.sessionId, sessionHost[open] == key { closePane() }
+        if key == "local" {
+            // Without the first server there's no host list either; start over on the next connect.
+            status = "Disconnected: \(reason)"
+            disconnect()
+        } else {
+            hostSessions[key] = nil
+            hostProblems[key] = "Disconnected"
+        }
+    }
+
+    /// The other hosts the server knows (`rex hosts`), each on a connection of its own.
+    func refreshHosts() async {
+        guard let c = controls["local"], let r = try? await c.call("hosts.list") else { return }
+        var listed: [String] = []
+        for h in r["hosts"] as? [[String: Any]] ?? [] {
+            guard let key = h["id"] as? String, let address = (h["endpoints"] as? [String])?.first,
+                  let ep = RexEndpoint(address) else { continue }
+            listed.append(key)
+            hostLabels[key] = h["label"] as? String ?? key
+            if controls[key] == nil { Task { await connectHost(key, endpoint: ep) } }
+        }
+        for key in hostOrder where key != "local" && !listed.contains(key) {
+            controls[key]?.onClose = nil; controls[key]?.close(); controls[key] = nil; hostSessions[key] = nil
+        }
+        hostOrder = ["local"] + listed
     }
 
     func disconnect() {
         closePane()
-        control?.onClose = nil; control?.close(); control = nil
+        for c in controls.values { c.onClose = nil; c.close() }
+        controls = [:]
         connected = false
-        sessionList = []; views = [:]
+        hostOrder = []; hostSessions = [:]; hostProblems = [:]; views = [:]; sessionHost = [:]
     }
 
-    var isIdle: Bool { control == nil }
+    var isIdle: Bool { controls["local"] == nil }
 
     func refresh() async {
-        guard let c = control, let r = try? await c.call("session.list") else { return }
-        setSessions(r)
+        for key in hostOrder {
+            if let c = controls[key], let r = try? await c.call("session.list") { setSessions(key, r) }
+        }
+        await refreshHosts()
     }
 
-    private func handle(_ type: String, _ payload: [String: Any]) {
+    // MARK: events
+
+    private func handle(_ host: String, _ type: String, _ payload: [String: Any]) {
         switch type {
         case "session_created", "session_destroyed", "session_moved":
-            Task { await refresh() }
+            Task { if let c = controls[host], let r = try? await c.call("session.list") { setSessions(host, r) } }
         case "session_event":
             let sessionId = payload["session_id"] as? String ?? ""
             let inner = payload["event"] as? [String: Any] ?? [:]
             switch inner["type"] as? String {
-            case "session_label_changed": Task { await refresh() }
+            case "session_label_changed":
+                Task { if let c = controls[host], let r = try? await c.call("session.list") { setSessions(host, r) } }
             case "session_view_changed": Task { await fetchView(sessionId) }
             case "block_event":
                 let block = inner["payload"] as? [String: Any] ?? [:]
@@ -111,6 +186,11 @@ final class AppModel: ObservableObject {
                 case "title_changed": titles[blockId] = p["title"] as? String ?? ""
                 case "program_status_changed": statuses[blockId] = (p["record"] as? [String: Any])?["state"] as? String
                 case "program_status_removed": statuses[blockId] = nil
+                case "url_clicked":
+                    // Every client attached to the pane hears of a click; open only links irex just clicked.
+                    guard let at = clickedAt.removeValue(forKey: blockId), Date.now.timeIntervalSince(at) < 3,
+                          let url = URL(string: p["url"] as? String ?? ""), ["http", "https", "mailto"].contains(url.scheme) else { return }
+                    UIApplication.shared.open(url)
                 default: break
                 }
             default: break
@@ -119,19 +199,21 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func setSessions(_ r: [String: Any]) {
-        sessionList = (r["sessions"] as? [[String: Any]] ?? []).compactMap {
+    private func setSessions(_ host: String, _ r: [String: Any]) {
+        let list: [(id: String, label: String)] = (r["sessions"] as? [[String: Any]] ?? []).compactMap {
             guard let id = $0["session_id"] as? String else { return nil }
             return (id, $0["label"] as? String ?? id)
         }
-        let ids = Set(sessionList.map(\.id))
-        views = views.filter { ids.contains($0.key) }
-        if let open = stream?.sessionId, !ids.contains(open) { closePane() }
-        for id in ids { Task { await fetchView(id) } }
+        let gone = Set((hostSessions[host] ?? []).map(\.id)).subtracting(list.map(\.id))
+        hostSessions[host] = list
+        for id in gone { views[id] = nil; sessionHost[id] = nil }
+        if let open = stream?.sessionId, gone.contains(open) { closePane() }
+        for s in list { sessionHost[s.id] = host; Task { await fetchView(s.id) } }
     }
 
     private func fetchView(_ sessionId: String) async {
-        guard let c = control, let view = try? await c.call("session.view", ["session_id": sessionId]), control === c else { return }
+        guard let c = control(for: sessionId), let view = try? await c.call("session.view", ["session_id": sessionId]),
+              control(for: sessionId) === c else { return }
         // Views can arrive out of order; keep the newest.
         if let old = views[sessionId]?["revision"] as? Int, let new = view["revision"] as? Int, new < old { return }
         views[sessionId] = view
@@ -152,14 +234,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: panes
+
     func open(_ p: Pane) async {
-        guard let c = control, stream?.blockId != p.id else { return }
+        guard let c = control(for: p.sessionId), stream?.blockId != p.id else { return }
         stream?.stop(); stream = nil
         openPaneId = p.id   // right away, so the iPhone pushes the terminal without waiting for the server
         do {
             try await c.call("session.attach", ["session_id": p.sessionId])
             guard openPaneId == p.id else { return }
             let bs = BlockStream(control: c, sessionId: p.sessionId, blockId: p.id, terminal: TerminalModel())
+            bs.fitOnOpen = UserDefaults.standard.object(forKey: "fitOnOpen") as? Bool ?? true
             bs.onEnded = { [weak self] reason in self?.status = "Stream ended: \(reason)" }
             stream = bs
             status = ""
@@ -168,13 +253,40 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// A new session with one shell in it, opened right away.
+    /// Opens the pane before or after the open one, through the session's tabs in order.
+    func openNeighbor(_ delta: Int) {
+        guard let s = stream, let session = sessions.first(where: { $0.id == s.sessionId }) else { return }
+        let panes = session.tabs.flatMap(\.panes)
+        guard let i = panes.firstIndex(where: { $0.id == s.blockId }), panes.indices.contains(i + delta) else { return }
+        let next = panes[i + delta]
+        show("\(next.title)  \(i + delta + 1)/\(panes.count)")
+        Task { await open(next) }
+    }
+
+    /// A short note over the terminal, such as which pane a swipe opened.
+    func show(_ text: String) {
+        toast = text
+        toastTask?.cancel()
+        toastTask = Task { try? await Task.sleep(for: .seconds(1.2)); if !Task.isCancelled { toast = nil } }
+    }
+
+    func clicked(_ blockId: String) { clickedAt[blockId] = .now }
+
+    /// A stream that only watches a pane, for previews; the caller stops it.
+    func watch(_ p: Pane) -> BlockStream? {
+        guard let c = control(for: p.sessionId) else { return nil }
+        let bs = BlockStream(control: c, sessionId: p.sessionId, blockId: p.id, terminal: TerminalModel())
+        Task { _ = try? await c.call("session.attach", ["session_id": p.sessionId]); await bs.start() }
+        return bs
+    }
+
+    /// A new session with one shell in it, on the server you connected to, opened right away.
     func newSession() async {
-        guard let c = control else { return }
+        guard let c = controls["local"] else { return }
         do {
             let r = try await c.call("session.create", ["initial_windows": [["layout": ["block": ["flavor": "com.superlogical.terminal.shell"]]]]])
             guard let id = r["session_id"] as? String else { return }
-            await refresh()
+            if let l = try? await c.call("session.list") { setSessions("local", l) }
             await fetchView(id)
             if let p = sessions.first(where: { $0.id == id })?.tabs.first?.panes.first { await open(p) }
         } catch {
@@ -200,6 +312,8 @@ struct ContentView: View {
     @State private var tabHovered = false
     @State private var columns = NavigationSplitViewVisibility.all   // explicit, so collapsing always reads as .detailOnly
     @State private var settingsShown = false
+    @State private var replyTo: AppModel.Pane?
+    @State private var composing = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -207,7 +321,7 @@ struct ContentView: View {
                 if let id, let p = app.pane(id) { Task { await app.open(p) } } else if id == nil { app.closePane() }
             })) {
                 ForEach(app.sessions) { s in
-                    Section(s.label) {
+                    Section {
                         ForEach(s.tabs) { t in
                             if s.tabs.count > 1 {
                                 Label(t.label.isEmpty ? "Tab" : t.label, systemImage: "rectangle.on.rectangle")
@@ -215,8 +329,14 @@ struct ContentView: View {
                                     .selectionDisabled()
                             }
                             ForEach(t.panes) { p in
-                                PaneRow(pane: p).padding(.leading, s.tabs.count > 1 ? 16 : 0).tag(p.id)
+                                PaneRow(pane: p, onReply: { replyTo = p }).padding(.leading, s.tabs.count > 1 ? 16 : 0).tag(p.id)
                             }
+                        }
+                    } header: {
+                        HStack {
+                            Text(s.label)
+                            Spacer()
+                            if let host = s.host { Label(host, systemImage: "desktopcomputer").labelStyle(.titleAndIcon) }
                         }
                     }
                 }
@@ -261,9 +381,22 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let s = app.stream {
-                    TerminalRepresentable(stream: s, fontSize: fontSize,
+                    TerminalRepresentable(stream: s, fontSize: fontSize, focusOnOpen: sizeClass != .compact,
                                           onEdgeSwipe: { if sizeClass == .compact { app.closePane() } else { columns = .all } },
-                                          onEdgeHover: { if !tabHovered { tabY = $0 } }).id(s.blockId)
+                                          onEdgeHover: { if !tabHovered { tabY = $0 } },
+                                          onCompose: { composing = true },
+                                          onSwipePane: { app.openNeighbor($0) },
+                                          onFontSizeChange: { fontSize = $0 },
+                                          onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) })
+                        .id(s.blockId)
+                        .overlay(alignment: .topTrailing) { PaneControls(stream: s, onCompose: { composing = true }) }
+                        .overlay {
+                            if let t = app.toast {
+                                Text(t).font(.callout.weight(.medium)).padding(.horizontal, 14).padding(.vertical, 8)
+                                    .background(.regularMaterial, in: Capsule()).transition(.opacity)
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.15), value: app.toast)
                 } else {
                     Spacer(); Text(app.sessions.isEmpty ? "Connect to a Rex server" : "Pick a pane").foregroundStyle(.secondary); Spacer()
                 }
@@ -298,6 +431,13 @@ struct ContentView: View {
             }
             .animation(.easeOut(duration: 0.12), value: tabY == nil && !tabHovered)
         }
+        .sheet(item: $replyTo) { p in
+            QuickReplyView(app: app, pane: p, onOpen: { replyTo = nil; Task { await app.open(p) } })
+                .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $composing) {
+            if let s = app.stream { ComposeView(stream: s).presentationDetents([.medium, .large]) }
+        }
         .sheet(isPresented: $settingsShown) { SettingsView(app: app, server: $server, fontSize: $fontSize, keepAwake: $keepAwake) }
         // Watching an agent work shouldn't lock the phone.
         .onChange(of: keepAwake && app.stream != nil, initial: true) { _, on in UIApplication.shared.isIdleTimerDisabled = on }
@@ -307,6 +447,7 @@ struct ContentView: View {
             guard p == .active else { return }
             // iOS drops sockets in the background; come back connected.
             if app.isIdle && !server.isEmpty { Task { await app.connect(server) } }
+            else if !app.isIdle { Task { await app.refreshHosts() } }
             else if let s = app.stream { Task { await s.claim(.sceneActive) } }
         }
     }
@@ -314,6 +455,7 @@ struct ContentView: View {
 
 struct PaneRow: View {
     let pane: AppModel.Pane
+    let onReply: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -322,7 +464,11 @@ struct PaneRow: View {
             Text(pane.title).lineLimit(1)
             Spacer(minLength: 4)
             if pane.status == "blocked" {
-                Text("Needs you").font(.caption.weight(.medium)).foregroundStyle(.red)
+                // Answer from the list: the question and its choices, without opening the pane.
+                Button(action: onReply) {
+                    Text("Reply").font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
             }
         }
     }
@@ -342,6 +488,7 @@ struct SettingsView: View {
     @Binding var server: String
     @Binding var fontSize: Double
     @Binding var keepAwake: Bool
+    @AppStorage("fitOnOpen") private var fitOnOpen = true
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -359,13 +506,23 @@ struct SettingsView: View {
                 } footer: {
                     Text("A Rex server, such as host.tailnet.ts.net:7297. Put account@ in front to connect as another account.")
                 }
+                if app.hosts.count > 1 {
+                    Section {
+                        ForEach(app.hosts) { h in LabeledContent(h.label, value: h.state) }
+                    } header: {
+                        Text("Hosts")
+                    } footer: {
+                        Text("The other hosts come from the server's `rex hosts` list.")
+                    }
+                }
                 Section {
                     Stepper("Text size \(Int(fontSize))", value: $fontSize, in: 9...24)
+                    Toggle("Fit panes to this screen", isOn: $fitOnOpen)
                     Toggle("Keep screen on", isOn: $keepAwake)
                 } header: {
                     Text("Terminal")
                 } footer: {
-                    Text("While a pane is open, the phone doesn't lock by itself.")
+                    Text("Fitting resizes a pane you open to this screen, and other clients see it at that size. Off, irex shows the pane at its own size until you type or tap Fit. Either way, the screen stays on while a pane is open if you keep it on.")
                 }
                 Section {
                     LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
@@ -381,8 +538,13 @@ struct SettingsView: View {
 struct TerminalRepresentable: UIViewRepresentable {
     let stream: BlockStream
     let fontSize: Double
+    let focusOnOpen: Bool
     let onEdgeSwipe: () -> Void
     let onEdgeHover: (CGFloat?) -> Void
+    let onCompose: () -> Void
+    let onSwipePane: (Int) -> Void
+    let onFontSizeChange: (Double) -> Void
+    let onCellTap: (Int, Int) -> Void
 
     func makeUIView(context: Context) -> TerminalView {
         let v = TerminalView(model: stream.terminal)
@@ -392,9 +554,14 @@ struct TerminalRepresentable: UIViewRepresentable {
         v.onActivate = { trigger in Task { await stream.claim(trigger) } }
         v.onEdgeSwipe = onEdgeSwipe
         v.onEdgeHover = onEdgeHover
+        v.onCompose = onCompose
+        v.onSwipePane = onSwipePane
+        v.onFontSizeChange = { onFontSizeChange(Double($0)) }
+        v.onCellTap = onCellTap
         Task {
             await stream.start()
-            v.becomeFirstResponder()
+            // iPad: ready for a hardware keyboard. iPhone: watch first; tap to bring up the keyboard.
+            if focusOnOpen { v.becomeFirstResponder() }
         }
         return v
     }
@@ -404,4 +571,126 @@ struct TerminalRepresentable: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ v: TerminalView, coordinator: ()) {}
+}
+
+/// Over the terminal's corner: write a longer message, and, while the pane keeps another
+/// client's size, fit it to this screen.
+struct PaneControls: View {
+    @ObservedObject var stream: BlockStream
+    let onCompose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if !stream.owning {
+                Button { Task { await stream.claim(.explicit) } } label: {
+                    Label("Fit", systemImage: "arrow.down.right.and.arrow.up.left").font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 10).frame(height: 34)
+                .background(.ultraThinMaterial, in: Capsule())
+            }
+            Button(action: onCompose) {
+                Image(systemName: "square.and.pencil").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34)
+            }
+            .background(.ultraThinMaterial, in: Circle())
+        }
+        .padding(.trailing, 6).padding(.top, 2)
+    }
+}
+
+/// A blocked agent's question and one-tap answers, read from a stream that only watches.
+struct QuickReplyView: View {
+    @ObservedObject var app: AppModel
+    let pane: AppModel.Pane
+    let onOpen: () -> Void
+    @StateObject private var preview = PanePreview()
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                ScrollView {
+                    Text(preview.lines.joined(separator: "\n"))
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(10)
+                }
+                .defaultScrollAnchor(.bottom)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                HStack(spacing: 8) {
+                    ForEach(["1", "2", "3"], id: \.self) { n in
+                        answer(n) { $0.send(Data(n.utf8)) }
+                    }
+                }
+                HStack(spacing: 8) {
+                    answer("Esc") { $0.send($0.terminal.escapeKey) }
+                    answer("Enter") { $0.send($0.terminal.enterKey) }
+                }
+            }
+            .padding()
+            .navigationTitle(pane.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Open", action: onOpen) }
+            }
+        }
+        .onAppear { preview.start(app.watch(pane)) }
+        .onDisappear { preview.stop() }
+    }
+
+    private func answer(_ title: String, _ send: @escaping (BlockStream) -> Void) -> some View {
+        Button {
+            guard let s = preview.stream else { return }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            send(s)
+            // Long enough to see the agent take it.
+            Task { try? await Task.sleep(for: .milliseconds(600)); dismiss() }
+        } label: {
+            Text(title).font(.title3.weight(.semibold).monospaced()).frame(maxWidth: .infinity, minHeight: 44)
+        }
+        .buttonStyle(.bordered)
+    }
+}
+
+/// The last lines of a watched pane, kept current as it draws.
+@MainActor
+final class PanePreview: ObservableObject {
+    @Published var lines: [String] = []
+    private(set) var stream: BlockStream?
+
+    func start(_ s: BlockStream?) {
+        stream = s
+        s?.terminal.onChange = { [weak self] in self?.lines = s?.terminal.lastLines(40) ?? [] }
+    }
+
+    func stop() { stream?.stop(); stream = nil }
+}
+
+/// A longer message than the terminal line is good for, with dictation, sent as one paste.
+struct ComposeView: View {
+    let stream: BlockStream
+    @AppStorage("composeEnter") private var pressEnter = true
+    @State private var text = ""
+    @FocusState private var focused: Bool
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextEditor(text: $text).frame(minHeight: 160).focused($focused)
+                Toggle("Press Enter after sending", isOn: $pressEnter)
+            }
+            .navigationTitle("Message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") { stream.sendText(text, enter: pressEnter); dismiss() }
+                        .disabled(text.isEmpty)
+                }
+            }
+            .onAppear { focused = true }
+        }
+    }
 }

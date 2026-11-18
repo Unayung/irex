@@ -8,16 +8,22 @@ enum ClaimTrigger {
     case sceneActive     // irex came back to the foreground (app switch, unlock, Stage Manager focus)
     case userTouch       // the user tapped the pane
     case keyboardInput   // the user typed into the pane
+    case explicit        // the user asked to fit the pane to this screen
 }
 
 /// One block's terminal stream: `data.connect` ticket → `/api/data` → snapshot → live VT.
 /// Input goes over the control socket (`terminal.write`), one request at a time.
 @MainActor
-final class BlockStream {
+final class BlockStream: ObservableObject {
     let sessionId: String
     let blockId: String
     let terminal: TerminalModel
     var onEnded: ((String) -> Void)?
+    /// Whether irex sizes this pane. Until it does, the pane keeps the owner's size and irex
+    /// shows it scaled down, so watching from a phone doesn't reflow it on the Mac.
+    @Published private(set) var owning = false
+    /// Take the pane as soon as it opens and when irex comes back, instead of watching first.
+    var fitOnOpen = false
 
     private let control: RexControl
     private let session = URLSession(configuration: .default)
@@ -32,6 +38,7 @@ final class BlockStream {
     private var writing = false
     private var wantedSize: (cols: Int, rows: Int)?
     private var resizeTask: Task<Void, Never>?
+    private var sizedAt = Date.distantPast   // when irex last took the pane or asked for a size
 
     init(control: RexControl, sessionId: String, blockId: String, terminal: TerminalModel) {
         self.control = control; self.sessionId = sessionId; self.blockId = blockId; self.terminal = terminal
@@ -59,7 +66,7 @@ final class BlockStream {
     func stop() {
         resizeTask?.cancel()
         let (s, b) = (sessionId, blockId)
-        Task { [control] in _ = try? await control.call("session.disown_block", ["session_id": s, "block_ids": [b]]) }
+        if owning { Task { [control] in _ = try? await control.call("session.disown_block", ["session_id": s, "block_ids": [b]]) } }
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
     }
@@ -68,16 +75,20 @@ final class BlockStream {
 
     /// Decides whether `trigger` should take this block away from whichever client owns it now.
     func shouldClaim(_ trigger: ClaimTrigger) -> Bool {
-        // Same rule as orex: the device you're holding sizes the pty. Opening, coming back to the
-        // foreground, or tapping the pane takes it; typing doesn't, since the tap already did.
+        // With fitOnOpen, the device you're holding sizes the pane, as in orex. Without it, irex
+        // watches first: typing into the pane, or asking, takes it.
         switch trigger {
-        case .streamStart, .sceneActive, .userTouch: return true
-        case .keyboardInput: return false
+        case .keyboardInput, .explicit: return !owning
+        case .streamStart: return fitOnOpen
+        case .sceneActive: return owning || fitOnOpen
+        case .userTouch: return false
         }
     }
 
     func claim(_ trigger: ClaimTrigger) async {
         guard shouldClaim(trigger) else { return }
+        owning = true
+        sizedAt = .now
         _ = try? await control.call("session.own_block", ["session_id": sessionId, "block_ids": [blockId], "mode": "take"])
         // Another client may have changed the size while it owned the block.
         if wantedSize != nil { sendSize() }
@@ -91,6 +102,7 @@ final class BlockStream {
         guard cols > 0, rows > 0 else { return }
         wantedSize = (cols, rows)
         resizeTask?.cancel()
+        guard owning else { return }
         resizeTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(120))
             if !Task.isCancelled { self?.sendSize() }
@@ -99,6 +111,7 @@ final class BlockStream {
 
     private func sendSize() {
         guard let s = wantedSize else { return }
+        sizedAt = .now
         Task { _ = try? await control.call("com.superlogical.terminal.resize",
                                            ["session_id": sessionId, "block_id": blockId, "args": ["columns": s.cols, "rows": s.rows]]) }
     }
@@ -108,6 +121,21 @@ final class BlockStream {
     func send(_ bytes: Data) {
         unsent.append(bytes)
         flush()
+    }
+
+    /// Text as a paste (bracketed when the program asks), then Enter if `enter`.
+    func sendText(_ text: String, enter: Bool) {
+        send(terminal.encodePaste(text))
+        if enter { send(terminal.enterKey) }
+    }
+
+    /// A left click at a cell of the server's screen. A link (OSC 8) there comes back as a
+    /// `url_clicked` block event.
+    func click(column: Int, row: Int) {
+        for action in ["press", "release"] {
+            Task { _ = try? await control.call("block.event", ["session_id": sessionId, "block_id": blockId,
+                "event": ["type": "mouse", "payload": ["action": action, "button": "left", "mods": "", "x": column, "y": row]]]) }
+        }
     }
 
     private func flush() {
@@ -190,7 +218,12 @@ final class BlockStream {
     private func handleRexMessage(_ m: [String: Any]) {
         switch m["type"] as? String {
         case "resize":
-            if let c = m["cols"] as? Int, let r = m["rows"] as? Int { terminal.resizeGrid(cols: c, rows: r) }
+            if let c = m["cols"] as? Int, let r = m["rows"] as? Int {
+                terminal.resizeGrid(cols: c, rows: r)
+                // A size irex didn't ask for means another client took the pane.
+                // Sizes from just before irex's own request can still be on the way, so wait them out.
+                if owning, let w = wantedSize, (w.cols, w.rows) != (c, r), Date.now.timeIntervalSince(sizedAt) > 1.5 { owning = false }
+            }
         case "theme":
             terminal.setTheme(m)
         case "child_exited":

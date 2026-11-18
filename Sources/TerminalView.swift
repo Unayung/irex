@@ -4,13 +4,18 @@ import GhosttyVt
 /// Draws a TerminalModel and turns keyboard input into terminal bytes.
 /// Printable text arrives through UIKeyInput.insertText (so the software keyboard and IME work);
 /// special keys and Ctrl/Option chords are caught in pressesBegan and go through libghostty's encoder.
-final class TerminalView: UIView, UIKeyInput {
+final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     let model: TerminalModel
     var onInput: ((Data) -> Void)?
     var onGridSize: ((Int, Int) -> Void)?
     var onActivate: ((ClaimTrigger) -> Void)?
     var onEdgeSwipe: (() -> Void)?
     var onEdgeHover: ((CGFloat?) -> Void)?
+    var onCompose: (() -> Void)?
+    var onSwipePane: ((Int) -> Void)?            // +1 next pane, -1 previous
+    var onFontSizeChange: ((CGFloat) -> Void)?
+    var onCellTap: ((Int, Int) -> Void)?         // column, row of the server's screen
+    let interactive: Bool                        // false: a preview that only draws
 
     private var font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
     private(set) var fontSize: CGFloat = 14
@@ -23,24 +28,44 @@ final class TerminalView: UIView, UIKeyInput {
     private weak var ctrlButton: UIButton?
     private let haptic = UIImpactFeedbackGenerator(style: .light)
     private lazy var keyBar = makeKeyBar()
+    private var scale: CGFloat = 1               // < 1 while showing another client's larger grid
+    private var selection: (a: (x: Int, y: Int), b: (x: Int, y: Int))?
+    private lazy var editMenu = UIEditMenuInteraction(delegate: self)
+    private var pinchBase: CGFloat = 14
+    private weak var scrollPan: UIPanGestureRecognizer?
+    private weak var panePan: UIPanGestureRecognizer?
 
-    init(model: TerminalModel) {
+    init(model: TerminalModel, interactive: Bool = true) {
         self.model = model
+        self.interactive = interactive
         super.init(frame: .zero)
         isOpaque = true
         contentMode = .redraw
         setFont(size: 14)
         model.onChange = { [weak self] in self?.setNeedsDisplay() }
+        guard interactive else { isUserInteractionEnabled = false; return }
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        // Up and down scrolls; sideways moves to the next or previous pane.
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned))
-        // ponytail: one finger scrolls; text selection will need long-press-then-drag when it lands.
         pan.allowedScrollTypesMask = .continuous   // trackpad two-finger scroll
+        pan.delegate = self
         addGestureRecognizer(pan)
+        scrollPan = pan
+        let sideways = UIPanGestureRecognizer(target: self, action: #selector(swiped))
+        sideways.delegate = self
+        addGestureRecognizer(sideways)
+        panePan = sideways
         let edge = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(edgeSwiped))
         edge.edges = .left
         addGestureRecognizer(edge)
-        pan.require(toFail: edge)   // a swipe from the left edge opens the sidebar instead of scrolling
+        pan.require(toFail: edge)        // a swipe from the left edge goes back (iPhone) or opens the sidebar (iPad)
+        sideways.require(toFail: edge)
+        let press = UILongPressGestureRecognizer(target: self, action: #selector(longPressed))
+        press.minimumPressDuration = 0.35
+        addGestureRecognizer(press)
+        addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched)))
         addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hovered)))
+        addInteraction(editMenu)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -85,6 +110,19 @@ final class TerminalView: UIView, UIKeyInput {
         let f = model.frame()
         ctx.setFillColor(f.background.cgColor)
         ctx.fill(bounds)
+        // Another client owns a bigger grid: show all of it, scaled down to fit.
+        let cols = f.rows.map { $0.last.map { $0.x + $0.width } ?? 0 }.max() ?? 0
+        scale = min(1, bounds.width / max(1, CGFloat(cols) * cw), bounds.height / max(1, CGFloat(f.rows.count) * ch))
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.scaleBy(x: scale, y: scale)
+        if let (a, b) = orderedSelection() {
+            ctx.setFillColor(tintColor.withAlphaComponent(0.35).cgColor)
+            for y in a.y...b.y {
+                let from = y == a.y ? a.x : 0, to = y == b.y ? b.x : cols - 1
+                ctx.fill(CGRect(x: CGFloat(from) * cw, y: CGFloat(y) * ch, width: CGFloat(to - from + 1) * cw, height: ch))
+            }
+        }
         for (y, row) in f.rows.enumerated() {
             let top = CGFloat(y) * ch
             for c in row where c.bg != nil {
@@ -146,7 +184,77 @@ final class TerminalView: UIView, UIKeyInput {
 
     // MARK: focus and gestures
 
-    override var canBecomeFirstResponder: Bool { true }
+    override var canBecomeFirstResponder: Bool { interactive }
+
+    /// The cell under a point of this view, in the server's grid.
+    private func cell(at p: CGPoint) -> (x: Int, y: Int) {
+        (max(0, Int(p.x / scale / cw)), max(0, Int(p.y / scale / ch)))
+    }
+
+    override func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+        guard let pan = g as? UIPanGestureRecognizer, pan === scrollPan || pan === panePan else { return super.gestureRecognizerShouldBegin(g) }
+        let v = pan.velocity(in: self)
+        let sideways = abs(v.x) > abs(v.y) * 1.5
+        return pan === panePan ? sideways && onSwipePane != nil : !sideways || onSwipePane == nil
+    }
+
+    @objc private func swiped(_ g: UIPanGestureRecognizer) {
+        guard g.state == .ended else { return }
+        let dx = g.translation(in: self).x
+        if abs(dx) > 70 { haptic.impactOccurred(); onSwipePane?(dx < 0 ? 1 : -1) }
+    }
+
+    // MARK: selection
+
+    private func orderedSelection() -> (a: (x: Int, y: Int), b: (x: Int, y: Int))? {
+        guard let s = selection else { return nil }
+        return (s.a.y, s.a.x) <= (s.b.y, s.b.x) ? (s.a, s.b) : (s.b, s.a)
+    }
+
+    @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
+        let p = g.location(in: self), c = cell(at: p)
+        switch g.state {
+        case .began: selection = (c, c); haptic.impactOccurred(); setNeedsDisplay()
+        case .changed: selection?.b = c; setNeedsDisplay()
+        case .ended: editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: p))
+        default: break
+        }
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        UIMenu(children: [
+            UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
+            UIAction(title: "Paste", image: UIImage(systemName: "doc.on.clipboard")) { [weak self] _ in
+                self?.selection = nil; self?.setNeedsDisplay(); self?.paste(nil)
+            },
+        ])
+    }
+
+    private func copySelection() {
+        let rows = model.frame().rows
+        guard let (a, b) = orderedSelection(), a.y < rows.count else { return }
+        var lines: [String] = []
+        for y in a.y...min(b.y, rows.count - 1) {
+            let from = y == a.y ? a.x : 0, to = y == b.y ? b.x : Int.max
+            var line = ""
+            for c in rows[y] where c.x >= from && c.x <= to { line += c.text.isEmpty ? " " : c.text }
+            lines.append(String(line.reversed().drop(while: { $0 == " " }).reversed()))
+        }
+        UIPasteboard.general.string = lines.joined(separator: "\n")
+        selection = nil
+        setNeedsDisplay()
+    }
+
+    @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began: pinchBase = fontSize
+        case .changed:
+            let size = min(24, max(9, (pinchBase * g.scale).rounded()))
+            if size != fontSize { setFont(size: size); onFontSizeChange?(size) }
+        default: break
+        }
+    }
 
     /// Like orex: a pointer on the left 6 pt brings out the sidebar tab at its height, and moving into
     /// the text puts it away. `.ended` is ignored: the pointer may have moved onto the tab, which says so itself.
@@ -160,19 +268,25 @@ final class TerminalView: UIView, UIKeyInput {
         if g.state == .ended, g.translation(in: self).x > 60 { onEdgeSwipe?() }
     }
 
-    @objc private func tapped() {
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        if selection != nil { selection = nil; setNeedsDisplay(); return }
         becomeFirstResponder()
         onActivate?(.userTouch)
+        // Only the live screen matches the server's coordinates, so links work at the bottom.
+        if model.atBottom { let c = cell(at: g.location(in: self)); onCellTap?(c.x, c.y) }
     }
 
     @objc private func panned(_ g: UIPanGestureRecognizer) {
         // Finger moves down → content moves down → older lines, like a wheel turned up.
+        if g.state == .began, selection != nil { selection = nil; setNeedsDisplay() }
         panRemainder += g.translation(in: self).y
         g.setTranslation(.zero, in: self)
-        let lines = Int(panRemainder / ch)
+        let lines = Int(panRemainder / (ch * scale))
         if lines != 0 {
-            panRemainder -= CGFloat(lines) * ch
-            let bytes = model.wheel(lines: lines, at: g.location(in: self), view: bounds.size, cell: CGSize(width: cw, height: ch))
+            panRemainder -= CGFloat(lines) * ch * scale
+            let p = g.location(in: self)
+            let bytes = model.wheel(lines: lines, at: CGPoint(x: p.x / scale, y: p.y / scale),
+                                    view: CGSize(width: bounds.width / scale, height: bounds.height / scale), cell: CGSize(width: cw, height: ch))
             if !bytes.isEmpty { onInput?(bytes) }
         }
         if g.state == .ended { panRemainder = 0 }
@@ -235,7 +349,7 @@ final class TerminalView: UIView, UIKeyInput {
             stack.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
             stack.heightAnchor.constraint(equalToConstant: 34),
         ])
-        func key(_ title: String? = nil, symbol: String? = nil, _ action: @escaping () -> Void) -> UIButton {
+        func key(_ title: String? = nil, symbol: String? = nil, repeats: Bool = false, _ action: @escaping () -> Void) -> UIButton {
             var c = UIButton.Configuration.gray()
             c.title = title
             c.image = symbol.map { UIImage(systemName: $0, withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)) } ?? nil
@@ -244,7 +358,21 @@ final class TerminalView: UIView, UIKeyInput {
             c.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
                 var a = $0; a.font = .monospacedSystemFont(ofSize: 15, weight: .medium); return a
             }
-            let b = UIButton(configuration: c, primaryAction: UIAction { [weak self] _ in self?.haptic.impactOccurred(); action() })
+            let b: UIButton
+            if repeats {
+                // Held down, it repeats like a hardware key.
+                b = UIButton(configuration: c)
+                b.addAction(UIAction { [weak self] _ in
+                    self?.haptic.impactOccurred(); action()
+                    self?.repeatTimer?.invalidate()
+                    self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+                        self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { _ in action() }
+                    }
+                }, for: .touchDown)
+                b.addAction(UIAction { [weak self] _ in self?.repeatTimer?.invalidate() }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
+            } else {
+                b = UIButton(configuration: c, primaryAction: UIAction { [weak self] _ in self?.haptic.impactOccurred(); action() })
+            }
             stack.addArrangedSubview(b)
             return b
         }
@@ -267,11 +395,12 @@ final class TerminalView: UIView, UIKeyInput {
         ctrlButton = ctrl
         _ = key("tab") { press(GHOSTTY_KEY_TAB, false) }
         _ = key("⇧tab") { press(GHOSTTY_KEY_TAB, true) }
-        _ = key(symbol: "arrow.left") { press(GHOSTTY_KEY_ARROW_LEFT, false) }
-        _ = key(symbol: "arrow.down") { press(GHOSTTY_KEY_ARROW_DOWN, false) }
-        _ = key(symbol: "arrow.up") { press(GHOSTTY_KEY_ARROW_UP, false) }
-        _ = key(symbol: "arrow.right") { press(GHOSTTY_KEY_ARROW_RIGHT, false) }
+        _ = key(symbol: "arrow.left", repeats: true) { press(GHOSTTY_KEY_ARROW_LEFT, false) }
+        _ = key(symbol: "arrow.down", repeats: true) { press(GHOSTTY_KEY_ARROW_DOWN, false) }
+        _ = key(symbol: "arrow.up", repeats: true) { press(GHOSTTY_KEY_ARROW_UP, false) }
+        _ = key(symbol: "arrow.right", repeats: true) { press(GHOSTTY_KEY_ARROW_RIGHT, false) }
         for ch in ["|", "~", "/", "-", "`"] { _ = key(ch) { [weak self] in self?.insertText(ch) } }
+        _ = key(symbol: "square.and.pencil") { [weak self] in self?.onCompose?() }
         _ = key(symbol: "keyboard.chevron.compact.down") { [weak self] in self?.resignFirstResponder() }
         return bar
     }

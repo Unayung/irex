@@ -55,6 +55,19 @@ func TestSummaryPutsBlockedFirst(t *testing.T) {
 	}
 }
 
+func TestMutedPanesStayOut(t *testing.T) {
+	now := time.Now()
+	s := &server{muted: map[string]bool{"block:rev": true, "session:quiet": true}, panes: map[string]*pane{
+		"block:rev": {block: "block:rev", session: "session:a", title: "REVIEWER", state: "working", changed: now},
+		"block:q":   {block: "block:q", session: "session:quiet", title: "in a muted session", state: "blocked", changed: now},
+		"block:b":   {block: "block:b", session: "session:a", title: "builder", state: "working", changed: now},
+	}}
+	c := s.summary()
+	if c.Working != 1 || c.Blocked != 0 || len(c.Items) != 1 || c.Items[0].Title != "builder" {
+		t.Fatalf("muted panes leaked into the summary: %+v", c)
+	}
+}
+
 func TestHexToken(t *testing.T) {
 	if !hexToken(strings.Repeat("ab", 32)) || hexToken("xyz") || hexToken(strings.Repeat("g", 64)) {
 		t.Fatal("hexToken")

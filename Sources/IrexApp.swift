@@ -10,7 +10,15 @@ struct IrexApp: App {
 
 @MainActor
 final class AppModel: ObservableObject {
-    struct Pane: Identifiable { let id: String; let sessionId: String; let title: String; let status: String }
+    struct Pane: Identifiable {
+        let id: String
+        let sessionId: String
+        let sessionLabel: String
+        let title: String
+        let status: String
+        let detail: String   // what the agent says it's doing
+        let since: Date?     // when its status last changed
+    }
     struct Tab: Identifiable { let id: String; let label: String; let panes: [Pane] }
     struct Session: Identifiable { let id: String; let label: String; let host: String?; let tabs: [Tab] }
     struct HostState: Identifiable { let id: String; let label: String; let state: String }
@@ -23,6 +31,8 @@ final class AppModel: ObservableObject {
     @Published private var views: [String: [String: Any]] = [:]     // session.view by session ID
     @Published private var titles: [String: String] = [:]           // block ID → title the program set
     @Published private var statuses: [String: String] = [:]         // block ID → working / blocked / done
+    @Published private var details: [String: String] = [:]          // block ID → the status's message
+    @Published private var since: [String: Date] = [:]              // block ID → when the status changed
     @Published var status = ""
     @Published var connected = false
     @Published var connecting = false
@@ -47,7 +57,8 @@ final class AppModel: ObservableObject {
                     return Tab(id: w["window_id"] as? String ?? "", label: w["label"] as? String ?? "", panes: blocks.compactMap { b in
                         guard let id = b["block_id"] as? String else { return nil }
                         let title = titles[id].flatMap { $0.isEmpty ? nil : $0 } ?? b["label"] as? String ?? "Pane"
-                        return Pane(id: id, sessionId: s.id, title: title, status: statuses[id] ?? "")
+                        return Pane(id: id, sessionId: s.id, sessionLabel: s.label, title: title, status: statuses[id] ?? "",
+                                    detail: details[id] ?? "", since: since[id])
                     })
                 })
             }
@@ -63,7 +74,8 @@ final class AppModel: ObservableObject {
 
     /// "1 needs you · 3 working", or how many panes there are when nothing's going on.
     var summary: String {
-        let panes = sessions.flatMap(\.tabs).flatMap(\.panes)
+        let muted = Push.shared.muted
+        let panes = sessions.filter { !muted.contains($0.id) }.flatMap(\.tabs).flatMap(\.panes).filter { !muted.contains($0.id) }
         let blocked = panes.filter { $0.status == "blocked" }.count, working = panes.filter { $0.status == "working" }.count
         let parts = (blocked > 0 ? ["\(blocked) need\(blocked == 1 ? "s" : "") you"] : []) + (working > 0 ? ["\(working) working"] : [])
         if !parts.isEmpty { return parts.joined(separator: " · ") }
@@ -190,8 +202,8 @@ final class AppModel: ObservableObject {
                 let p = block["payload"] as? [String: Any] ?? [:]
                 switch block["name"] as? String {
                 case "title_changed": titles[blockId] = p["title"] as? String ?? ""
-                case "program_status_changed": statuses[blockId] = (p["record"] as? [String: Any])?["state"] as? String
-                case "program_status_removed": statuses[blockId] = nil
+                case "program_status_changed": record(blockId, p["record"] as? [String: Any])
+                case "program_status_removed": record(blockId, nil)
                 case "url_clicked":
                     // Every client attached to the pane hears of a click; open only links irex just clicked.
                     guard let at = clickedAt.removeValue(forKey: blockId), Date.now.timeIntervalSince(at) < 3,
@@ -203,6 +215,21 @@ final class AppModel: ObservableObject {
             }
         default: break
         }
+    }
+
+    /// A program status record (OSC 7501): its state, message, and when it was reported.
+    private func record(_ block: String, _ r: [String: Any]?) {
+        statuses[block] = r?["state"] as? String
+        // Without a message, say what kind of wait it is, such as asking for permission.
+        let kind = (r?["kind"] as? String).map { "Asking for \($0)" }
+        details[block] = (r?["msg"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (r?["state"] as? String == "blocked" ? kind : nil)
+        since[block] = (r?["updated_at"] as? String).flatMap(Self.parseDate) ?? (r == nil ? nil : .now)
+    }
+
+    /// RFC 3339 with up to nanoseconds, which ISO8601DateFormatter can't read: drop the fraction.
+    static func parseDate(_ s: String) -> Date? {
+        let trimmed = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        return ISO8601DateFormatter().date(from: trimmed)
     }
 
     private func setSessions(_ host: String, _ r: [String: Any]) {
@@ -234,7 +261,7 @@ final class AppModel: ObservableObject {
                         if let t = try? await c.call("com.superlogical.terminal.title", target)["title"] as? String, !t.isEmpty { titles[id] = t }
                         // A status set before irex connected only comes from here.
                         if let r = try? await c.call("com.superlogical.terminal.program_status", target),
-                           let state = (r["records"] as? [[String: Any]])?.first?["state"] as? String { statuses[id] = state }
+                           let first = (r["records"] as? [[String: Any]])?.first { record(id, first) }
                     }
                 }
             }
@@ -342,39 +369,38 @@ struct ContentView: View {
     @AppStorage("keepAwake") private var keepAwake = true
     @Environment(\.scenePhase) private var phase
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @State private var tabY: CGFloat?        // pointer height on the left edge while it's there
-    @State private var tabHovered = false
-    @State private var columns = NavigationSplitViewVisibility.all   // explicit, so collapsing always reads as .detailOnly
+    @State private var columns = NavigationSplitViewVisibility.all
+    @State private var compactColumn = NavigationSplitViewColumn.sidebar   // iPhone: the list, or the pane
     @State private var settingsShown = false
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
-            List(selection: Binding(get: { app.openPaneId }, set: { id in
-                if let id, let p = app.pane(id) { Task { await app.open(p) } } else if id == nil { app.closePane() }
-            })) {
-                ForEach(app.sessions) { s in
-                    Section {
-                        ForEach(s.tabs) { t in
-                            if s.tabs.count > 1 {
-                                Label(t.label.isEmpty ? "Tab" : t.label, systemImage: "rectangle.on.rectangle")
-                                    .font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-                                    .selectionDisabled()
-                            }
-                            ForEach(t.panes) { p in
-                                PaneRow(pane: p, onReply: { replyTo = p }).padding(.leading, s.tabs.count > 1 ? 16 : 0).tag(p.id)
-                            }
+        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    // Who's waiting on you comes first, wherever their sessions are.
+                    let waiting = app.sessions.filter { !push.muted.contains($0.id) }.flatMap(\.tabs).flatMap(\.panes)
+                        .filter { $0.status == "blocked" && !push.muted.contains($0.id) }
+                    if !waiting.isEmpty {
+                        Text("Needs you").font(.footnote.weight(.semibold)).foregroundStyle(.red).textCase(.uppercase)
+                            .padding(.leading, 4)
+                        ForEach(waiting) { p in
+                            NeedsYouCard(pane: p, onReply: { replyTo = p }, onOpen: { Task { await app.open(p) } })
                         }
-                    } header: {
-                        HStack {
-                            Text(s.label)
-                            Spacer()
-                            if let host = s.host { Label(host, systemImage: "desktopcomputer").labelStyle(.titleAndIcon) }
-                        }
+                        Text("Sessions").font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                            .padding(.leading, 4).padding(.top, 6)
+                    }
+                    ForEach(app.sessions) { s in
+                        SessionCard(session: s, mutedIDs: push.muted, openPaneId: app.openPaneId,
+                                    onOpen: { p in Task { await app.open(p) } },
+                                    onMute: { id, on in push.setMuted(id, on) })
                     }
                 }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .animation(.default, value: app.sessions.flatMap(\.tabs).flatMap(\.panes).map(\.status))
             }
+            .background(Color(.systemGroupedBackground))
             .overlay {
                 if app.connecting && app.sessions.isEmpty {
                     ProgressView("Connecting…")
@@ -415,15 +441,17 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let s = app.stream {
+                    PaneHeader(stream: s, pane: app.pane(s.blockId), compact: sizeClass == .compact,
+                               onBack: { if sizeClass == .compact { app.closePane() } else { columns = columns == .detailOnly ? .all : .detailOnly } },
+                               onCompose: { composing = true })
                     TerminalRepresentable(stream: s, fontSize: fontSize, focusOnOpen: sizeClass != .compact,
                                           onEdgeSwipe: { if sizeClass == .compact { app.closePane() } else { columns = .all } },
-                                          onEdgeHover: { if !tabHovered { tabY = $0 } },
+                                          onEdgeHover: { _ in },
                                           onCompose: { composing = true },
                                           onSwipePane: { app.openNeighbor($0) },
                                           onFontSizeChange: { fontSize = $0 },
                                           onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) })
                         .id(s.blockId)
-                        .overlay(alignment: .topTrailing) { PaneControls(stream: s, onCompose: { composing = true }) }
                         .overlay {
                             if let t = app.toast {
                                 Text(t).font(.callout.weight(.medium)).padding(.horizontal, 14).padding(.vertical, 8)
@@ -434,38 +462,15 @@ struct ContentView: View {
                 } else if app.opening {
                     Spacer(); ProgressView("Opening…"); Spacer()
                 } else {
-                    Spacer(); Text(app.sessions.isEmpty ? "Connect to a Rex server" : "Pick a pane").foregroundStyle(.secondary); Spacer()
+                    ContentUnavailableView(app.sessions.isEmpty ? "Not connected" : "Pick a pane",
+                                           systemImage: app.sessions.isEmpty ? "network.slash" : "terminal",
+                                           description: Text(app.sessions.isEmpty ? "Connect to a Rex server in Settings." : "Choose one from the list."))
                 }
                 if !app.status.isEmpty {
                     Text(app.status).font(.footnote).foregroundStyle(.secondary).padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            // The terminal gets the whole height; the way back is a small button instead of a bar.
             .toolbar(.hidden, for: .navigationBar)
-            .overlay(alignment: .topLeading) {
-                if sizeClass == .compact {
-                    // iPhone: back to the list (a swipe from the left edge does the same).
-                    Button { app.closePane() } label: {
-                        Image(systemName: "chevron.left").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34)
-                    }
-                    .background(.ultraThinMaterial, in: Circle())
-                    .padding(.leading, 6).padding(.top, 2)
-                } else if columns == .detailOnly && (tabY != nil || tabHovered || app.stream == nil) {
-                    // orex's reveal tab: hidden until the pointer touches the left edge, then out at its height.
-                    // Touch opens the sidebar with an edge swipe; with no terminal there's no edge, so it stays out.
-                    GeometryReader { geo in
-                        Button { columns = .all; tabY = nil; tabHovered = false } label: {
-                            Image(systemName: "chevron.right").font(.system(size: 14, weight: .semibold)).frame(width: 26, height: 40)
-                        }
-                        .background(tabHovered ? Color.accentColor.opacity(0.35) : Color(.secondarySystemBackground),
-                                    in: RoundedRectangle(cornerRadius: 6))
-                        .onHover { tabHovered = $0 }
-                        .offset(y: min(max(4, (tabY ?? 24) - 20), geo.size.height - 44))
-                    }
-                    .transition(.move(edge: .leading))
-                }
-            }
-            .animation(.easeOut(duration: 0.12), value: tabY == nil && !tabHovered)
         }
         .sheet(item: $replyTo) { p in
             QuickReplyView(app: app, pane: p, onOpen: { replyTo = nil; Task { await app.open(p) } })
@@ -484,8 +489,21 @@ struct ContentView: View {
             if let id = UserDefaults.standard.string(forKey: "openBlock") { push.pendingBlock = id }
             #endif
             if server.isEmpty { settingsShown = true; return }
-            push.start(server: server)
+            #if DEBUG
+            let review = UserDefaults.standard.bool(forKey: "noPush")   // simulator review: no permission prompt
+            #else
+            let review = false
+            #endif
+            if !review { push.start(server: server) }
             await app.connect(server)
+            #if DEBUG
+            // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
+            if UserDefaults.standard.bool(forKey: "showSettings") { settingsShown = true }
+            if let want = UserDefaults.standard.string(forKey: "showReply") {
+                try? await Task.sleep(for: .seconds(3))
+                replyTo = app.sessions.flatMap(\.tabs).flatMap(\.panes).first { $0.title.contains(want) }
+            }
+            #endif
         }
         .onChange(of: server) { _, s in if !s.isEmpty { push.start(server: s) } }
         // A notification or the Live Activity asked for a pane: open it once the list has it.
@@ -499,46 +517,24 @@ struct ContentView: View {
             var t = Transaction(); t.disablesAnimations = true
             withTransaction(t) { app.openWhenListed(id) }
         }
-        .onChange(of: app.openPaneId) { _, id in push.showing = id }
+        .onChange(of: app.openPaneId) { _, id in
+            push.showing = id
+            compactColumn = id == nil ? .sidebar : .detail
+        }
         .onChange(of: phase) { _, p in
             guard p == .active else { return }
             // iOS drops sockets in the background; come back connected.
-            if app.isIdle && !server.isEmpty { Task { await app.connect(server) } }
-            else if !app.isIdle { Task { await app.refreshHosts() } }
-            else if let s = app.stream { Task { await s.claim(.sceneActive) } }
-        }
-    }
-}
-
-struct PaneRow: View {
-    let pane: AppModel.Pane
-    let onReply: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "circle.fill").font(.system(size: 8)).foregroundStyle(color)
-                .symbolEffect(.pulse, isActive: pane.status == "working")
-            Text(pane.title).lineLimit(1)
-            Spacer(minLength: 4)
-            if pane.status == "blocked" {
-                // Answer from the list: the question and its choices, without opening the pane.
-                Button(action: onReply) {
-                    Text("Reply").font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
+            if app.isIdle {
+                if !server.isEmpty { Task { await app.connect(server) } }
+            } else {
+                Task { await app.refreshHosts() }
+                if let s = app.stream { Task { await s.claim(.sceneActive) } }
             }
-        }
-    }
-
-    private var color: Color {
-        switch pane.status {
-        case "blocked": .red
-        case "working": .orange
-        case "done": .green
-        default: Color.secondary.opacity(0.3)
+            push.loadMutes()
         }
     }
 }
+
 
 struct SettingsView: View {
     @ObservedObject var app: AppModel
@@ -638,85 +634,7 @@ struct TerminalRepresentable: UIViewRepresentable {
     static func dismantleUIView(_ v: TerminalView, coordinator: ()) {}
 }
 
-/// Over the terminal's corner: write a longer message, and, while the pane keeps another
-/// client's size, fit it to this screen.
-struct PaneControls: View {
-    @ObservedObject var stream: BlockStream
-    let onCompose: () -> Void
 
-    var body: some View {
-        HStack(spacing: 6) {
-            if !stream.owning {
-                Button { Task { await stream.claim(.explicit) } } label: {
-                    Label("Fit", systemImage: "arrow.down.right.and.arrow.up.left").font(.caption.weight(.semibold))
-                }
-                .padding(.horizontal, 10).frame(height: 34)
-                .background(.ultraThinMaterial, in: Capsule())
-            }
-            Button(action: onCompose) {
-                Image(systemName: "square.and.pencil").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34)
-            }
-            .background(.ultraThinMaterial, in: Circle())
-        }
-        .padding(.trailing, 6).padding(.top, 2)
-    }
-}
-
-/// A blocked agent's question and one-tap answers, read from a stream that only watches.
-struct QuickReplyView: View {
-    @ObservedObject var app: AppModel
-    let pane: AppModel.Pane
-    let onOpen: () -> Void
-    @StateObject private var preview = PanePreview()
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 14) {
-                ScrollView {
-                    Text(preview.lines.joined(separator: "\n"))
-                        .font(.system(size: 12, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(10)
-                }
-                .defaultScrollAnchor(.bottom)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
-                HStack(spacing: 8) {
-                    ForEach(["1", "2", "3"], id: \.self) { n in
-                        answer(n) { $0.send(Data(n.utf8)) }
-                    }
-                }
-                HStack(spacing: 8) {
-                    answer("Esc") { $0.send($0.terminal.escapeKey) }
-                    answer("Enter") { $0.send($0.terminal.enterKey) }
-                }
-            }
-            .padding()
-            .navigationTitle(pane.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Open", action: onOpen) }
-            }
-        }
-        .onAppear { preview.start(app.watch(pane)) }
-        .onDisappear { preview.stop() }
-    }
-
-    private func answer(_ title: String, _ send: @escaping (BlockStream) -> Void) -> some View {
-        Button {
-            guard let s = preview.stream else { return }
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            send(s)
-            // Long enough to see the agent take it.
-            Task { try? await Task.sleep(for: .milliseconds(600)); dismiss() }
-        } label: {
-            Text(title).font(.title3.weight(.semibold).monospaced()).frame(maxWidth: .infinity, minHeight: 44)
-        }
-        .buttonStyle(.bordered)
-    }
-}
 
 /// The last lines of a watched pane, kept current as it draws.
 @MainActor

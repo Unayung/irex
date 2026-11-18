@@ -15,6 +15,8 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     @Published var pendingBlock: String?
     /// The pane on screen, so its own notifications don't pop up over it.
     var showing: String?
+    /// Sessions and panes irex-push keeps quiet: no notifications, not in the Live Activity.
+    @Published private(set) var muted: Set<String> = []
 
     private var relay: URL?
     private var deviceToken: String?
@@ -38,6 +40,7 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
             state = allowed ? "Waiting for the device token…" : "Not allowed. Turn them on in iOS Settings."
             if allowed { UIApplication.shared.registerForRemoteNotifications() }
         }
+        loadMutes()
         guard !watching else { send(); return }
         watching = true
         if #available(iOS 17.2, *) {
@@ -77,6 +80,33 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
                 state = code == 204 ? "On" : "irex-push answered \(code)"
             } catch {
                 state = "Can't reach irex-push on \(relay.host ?? "the server")"
+            }
+        }
+    }
+
+    func loadMutes() {
+        guard let relay else { return }
+        Task {
+            guard let (data, _) = try? await URLSession.shared.data(from: relay.appending(path: "mutes")),
+                  let r = try? JSONDecoder().decode([String: [String]].self, from: data) else { return }
+            muted = Set(r["muted"] ?? [])
+        }
+    }
+
+    /// Mutes or unmutes a session or pane ID, for every device, since irex-push sends for all of them.
+    func setMuted(_ id: String, _ on: Bool) {
+        guard let relay else { return }
+        if on { muted.insert(id) } else { muted.remove(id) }   // show it now; the answer confirms it
+        var req = URLRequest(url: relay.appending(path: "mutes"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["id": id, "muted": on])
+        Task {
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let r = try? JSONDecoder().decode([String: [String]].self, from: data) {
+                muted = Set(r["muted"] ?? [])
+            } else {
+                loadMutes()
             }
         }
     }

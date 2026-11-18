@@ -29,6 +29,9 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     private let haptic = UIImpactFeedbackGenerator(style: .light)
     private lazy var keyBar = makeKeyBar()
     private var scale: CGFloat = 1               // < 1 while showing another client's larger grid
+    /// Room between the text and the screen's edges.
+    private let inset = UIEdgeInsets(top: 4, left: 6, bottom: 4, right: 6)
+    private var content: CGRect { bounds.inset(by: interactive ? inset : .zero) }
     private var selection: (a: (x: Int, y: Int), b: (x: Int, y: Int))?
     private lazy var editMenu = UIEditMenuInteraction(delegate: self)
     private var pinchBase: CGFloat = 14
@@ -97,7 +100,7 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     }
 
     private func refit() {
-        let cols = Int(bounds.width / cw), rows = Int(bounds.height / ch)
+        let cols = Int(content.width / cw), rows = Int(content.height / ch)
         guard cols > 0, rows > 0, (cols, rows) != grid else { return }
         grid = (cols, rows)
         onGridSize?(cols, rows)
@@ -112,9 +115,11 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
         ctx.fill(bounds)
         // Another client owns a bigger grid: show all of it, scaled down to fit.
         let cols = f.rows.map { $0.last.map { $0.x + $0.width } ?? 0 }.max() ?? 0
-        scale = min(1, bounds.width / max(1, CGFloat(cols) * cw), bounds.height / max(1, CGFloat(f.rows.count) * ch))
+        let area = content
+        scale = min(1, area.width / max(1, CGFloat(cols) * cw), area.height / max(1, CGFloat(f.rows.count) * ch))
         ctx.saveGState()
         defer { ctx.restoreGState() }
+        ctx.translateBy(x: area.minX, y: area.minY)
         ctx.scaleBy(x: scale, y: scale)
         if let (a, b) = orderedSelection() {
             ctx.setFillColor(tintColor.withAlphaComponent(0.35).cgColor)
@@ -188,7 +193,7 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
 
     /// The cell under a point of this view, in the server's grid.
     private func cell(at p: CGPoint) -> (x: Int, y: Int) {
-        (max(0, Int(p.x / scale / cw)), max(0, Int(p.y / scale / ch)))
+        (max(0, Int((p.x - content.minX) / scale / cw)), max(0, Int((p.y - content.minY) / scale / ch)))
     }
 
     override func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
@@ -285,8 +290,8 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
         if lines != 0 {
             panRemainder -= CGFloat(lines) * ch * scale
             let p = g.location(in: self)
-            let bytes = model.wheel(lines: lines, at: CGPoint(x: p.x / scale, y: p.y / scale),
-                                    view: CGSize(width: bounds.width / scale, height: bounds.height / scale), cell: CGSize(width: cw, height: ch))
+            let bytes = model.wheel(lines: lines, at: CGPoint(x: (p.x - content.minX) / scale, y: (p.y - content.minY) / scale),
+                                    view: CGSize(width: content.width / scale, height: content.height / scale), cell: CGSize(width: cw, height: ch))
             if !bytes.isEmpty { onInput?(bytes) }
         }
         if g.state == .ended { panRemainder = 0 }

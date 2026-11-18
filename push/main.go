@@ -192,6 +192,7 @@ type server struct {
 	mu      sync.Mutex
 	panes   map[string]*pane // block ID → pane
 	devices map[string]*device
+	muted   map[string]bool // session or block IDs that stay quiet: no alerts, not in the Live Activity
 	// The Live Activity: whether one runs, what it last showed, and when anything last moved.
 	active     bool
 	shown      contentState
@@ -200,6 +201,30 @@ type server struct {
 }
 
 func (s *server) devicesFile() string { return filepath.Join(s.cfg.state, "devices.json") }
+func (s *server) mutedFile() string   { return filepath.Join(s.cfg.state, "muted.json") }
+
+func (s *server) loadMuted() {
+	s.muted = map[string]bool{}
+	var ids []string
+	if raw, err := os.ReadFile(s.mutedFile()); err == nil && json.Unmarshal(raw, &ids) == nil {
+		for _, id := range ids {
+			s.muted[id] = true
+		}
+	}
+}
+
+// mutedIDs lists the muted IDs, sorted; call with s.mu held.
+func (s *server) mutedIDs() []string {
+	ids := []string{}
+	for id := range s.muted {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// isMuted says whether a pane, or its session, is muted; call with s.mu held.
+func (s *server) isMuted(p *pane) bool { return s.muted[p.block] || s.muted[p.session] }
 
 func (s *server) loadDevices() {
 	s.devices = map[string]*device{}
@@ -400,8 +425,11 @@ func (s *server) event(host string, line []byte) {
 // alert notifies when an agent starts waiting on you, or finishes what it was doing.
 func (s *server) alert(p *pane, was string) {
 	s.mu.Lock()
-	title, msg, state := p.title, p.msg, p.state
+	title, msg, state, quiet := p.title, p.msg, p.state, s.isMuted(p)
 	s.mu.Unlock()
+	if quiet {
+		return
+	}
 	if title == "" {
 		title = "A pane"
 	}
@@ -465,6 +493,9 @@ func (s *server) summary() contentState {
 	c := contentState{Items: []item{}} // never null: the app decodes an array
 	var rows []*pane
 	for _, p := range s.panes {
+		if s.isMuted(p) {
+			continue
+		}
 		switch p.state {
 		case "working":
 			c.Working++
@@ -655,6 +686,40 @@ func hexToken(t string) bool {
 	return ok
 }
 
+// mutes lists the muted IDs (GET) or mutes or unmutes one (POST {"id", "muted"}).
+func (s *server) mutes(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var in struct {
+			ID    string `json:"id"`
+			Muted bool   `json:"muted"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&in); err != nil || len(in.ID) > 100 ||
+			!(strings.HasPrefix(in.ID, "session:") || strings.HasPrefix(in.ID, "block:")) {
+			http.Error(w, "bad mute", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		if in.Muted {
+			s.muted[in.ID] = true
+		} else {
+			delete(s.muted, in.ID)
+		}
+		raw, _ := json.Marshal(s.mutedIDs())
+		_ = os.MkdirAll(s.cfg.state, 0o700)
+		_ = os.WriteFile(s.mutedFile(), raw, 0o600)
+		s.mu.Unlock()
+		s.changed()
+	} else if r.Method != http.MethodGet {
+		http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	ids := s.mutedIDs()
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"muted": ids})
+}
+
 // test sends every device a notification, to check the whole path.
 func (s *server) test(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -677,6 +742,7 @@ func main() {
 	}
 	s := &server{cfg: cfg, push: push, panes: map[string]*pane{}, dirty: make(chan struct{}, 1)}
 	s.loadDevices()
+	s.loadMuted()
 
 	var hosts struct {
 		Hosts []struct {
@@ -692,6 +758,7 @@ func main() {
 
 	http.HandleFunc("/register", s.register)
 	http.HandleFunc("/test", s.test)
+	http.HandleFunc("/mutes", s.mutes)
 	log.Printf("listening on %s for %d device(s), watching %d host(s)", cfg.listen, len(s.devices), 1+len(hosts.Hosts))
 	log.Fatal(http.ListenAndServe(cfg.listen, nil))
 }

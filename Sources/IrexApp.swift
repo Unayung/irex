@@ -371,18 +371,46 @@ final class AppModel: ObservableObject {
         return bs
     }
 
-    /// A new session with one shell in it, on the server you connected to, opened right away.
-    func newSession() async {
-        guard let c = controls["local"] else { return }
+    /// Hosts a new session can go to: the ones connected now, the server you connected to first.
+    var connectedHosts: [HostState] { hosts.filter { controls[$0.id] != nil && hostSessions[$0.id] != nil } }
+
+    /// A new session with one shell in it, on `host`, named `label` (or by the server), opened right away.
+    func newSession(on host: String = "local", label: String = "") async {
+        guard let c = controls[host] else { return }
+        var payload: [String: Any] = ["initial_windows": [["layout": ["block": ["flavor": "com.superlogical.terminal.shell"]]]]]
+        let name = label.trimmingCharacters(in: .whitespaces)
+        if !name.isEmpty { payload["label"] = name }
         do {
-            let r = try await c.call("session.create", ["initial_windows": [["layout": ["block": ["flavor": "com.superlogical.terminal.shell"]]]]])
+            let r = try await c.call("session.create", payload)
             guard let id = r["session_id"] as? String else { return }
-            if let l = try? await c.call("session.list") { setSessions("local", l) }
+            if let l = try? await c.call("session.list") { setSessions(host, l) }
             await fetchView(id)
             if let p = sessions.first(where: { $0.id == id })?.tabs.first?.panes.first { await open(p) }
         } catch {
             status = "\(error)"
         }
+    }
+
+    func rename(_ sessionId: String, to label: String) async {
+        guard let c = control(for: sessionId), let host = sessionHost[sessionId] else { return }
+        do {
+            try await c.call("session.set_label", ["session_id": sessionId, "label": label.trimmingCharacters(in: .whitespaces)])
+            if let l = try? await c.call("session.list") { setSessions(host, l) }
+        } catch { status = "\(error)" }
+    }
+
+    /// Ends a session and every program in it, on whichever host has it.
+    func closeSession(_ sessionId: String) async {
+        guard let c = control(for: sessionId) else { return }
+        if stream?.sessionId == sessionId { closePane() }
+        do { try await c.call("session.destroy", ["session_id": sessionId]) } catch { status = "\(error)" }
+    }
+
+    /// Closes one pane, hanging up the program in it, as closing a terminal does.
+    func closeBlock(_ p: Pane) async {
+        guard let c = control(for: p.sessionId) else { return }
+        if stream?.blockId == p.id { closePane() }
+        do { try await c.call("block.close", ["session_id": p.sessionId, "block_id": p.id]) } catch { status = "\(error)" }
     }
 
     /// On iPhone the list and the pane share the screen, so searching the list leaves the pane.
@@ -409,6 +437,11 @@ struct ContentView: View {
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
     @State private var query = ""
+    @State private var renaming: AppModel.Session?
+    @State private var newName = ""
+    @State private var closingSession: AppModel.Session?
+    @State private var closingPane: AppModel.Pane?
+    @State private var creating = false
     @State private var photosShown = false
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var cameraShown = false
@@ -462,6 +495,9 @@ struct ContentView: View {
                         SessionCard(session: s, mutedIDs: push.muted, openPaneId: app.openPaneId,
                                     onOpen: { p in Task { await app.open(p) } },
                                     onMute: { id, on in push.setMuted(id, on) },
+                                    onRename: { newName = s.label; renaming = s },
+                                    onClose: { closingSession = s },
+                                    onClosePane: { closingPane = $0 },
                                     searching: !query.isEmpty)
                     }
                     if !query.isEmpty && shown.isEmpty {
@@ -511,8 +547,9 @@ struct ContentView: View {
                     Button { settingsShown = true } label: { Image(systemName: "gearshape") }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await app.newSession() } } label: { Image(systemName: "plus") }
+                    Button { creating = true } label: { Image(systemName: "plus") }
                         .disabled(!app.connected)
+                        .accessibilityLabel("New session")
                 }
             }
         } detail: {
@@ -589,9 +626,38 @@ struct ContentView: View {
                 .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $composing) {
-            if let s = app.stream { ComposeView(stream: s).presentationDetents([.medium, .large]) }
+            if let s = app.stream { ComposeView(stream: s, paneTitle: app.pane(s.blockId)?.title).presentationDetents([.medium, .large]) }
         }
         .background { shortcuts }
+        .sheet(isPresented: $creating) {
+            NewSessionView(hosts: app.connectedHosts) { host, name in
+                creating = false
+                Task { await app.newSession(on: host, label: name) }
+            }
+            .presentationDetents([.medium])
+        }
+        .alert("Rename Session", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Name", text: $newName).textInputAutocapitalization(.never).autocorrectionDisabled()
+            Button("Rename") { if let s = renaming { Task { await app.rename(s.id, to: newName) } } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Leave it empty to go back to the name the server chose.")
+        }
+        // Closing ends the programs in it, on every client, so it asks first.
+        .confirmationDialog(closingSession.map { "Close \($0.label)?" } ?? "",
+                            isPresented: Binding(get: { closingSession != nil }, set: { if !$0 { closingSession = nil } }),
+                            titleVisibility: .visible) {
+            Button("Close Session", role: .destructive) { if let s = closingSession { Task { await app.closeSession(s.id) } } }
+        } message: {
+            Text("Every pane in it closes, and the programs running there stop, for every client.")
+        }
+        .confirmationDialog(closingPane.map { "Close \($0.title)?" } ?? "",
+                            isPresented: Binding(get: { closingPane != nil }, set: { if !$0 { closingPane = nil } }),
+                            titleVisibility: .visible) {
+            Button("Close Pane", role: .destructive) { if let p = closingPane { Task { await app.closeBlock(p) } } }
+        } message: {
+            Text("The program running in it stops, for every client.")
+        }
         .photosPicker(isPresented: $photosShown, selection: $photoItems, maxSelectionCount: 5, matching: .images)
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty, let s = app.stream else { return }
@@ -638,6 +704,11 @@ struct ContentView: View {
             #if DEBUG
             // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
             if UserDefaults.standard.bool(forKey: "showSettings") { settingsShown = true }
+            if UserDefaults.standard.bool(forKey: "showNewSession") { creating = true }
+            if UserDefaults.standard.bool(forKey: "showCompose") {
+                try? await Task.sleep(for: .seconds(5))
+                composing = app.stream != nil
+            }
             if let q = UserDefaults.standard.string(forKey: "query") { query = q }   // `-query <text>`
             if let demo = UserDefaults.standard.string(forKey: "demoActivity") { push.demoActivity(demo) }
             if UserDefaults.standard.bool(forKey: "renderActivity") { push.renderActivity() }
@@ -770,7 +841,7 @@ extension ContentView {
             Button("Previous Pane") { app.openNeighbor(-1) }.keyboardShortcut("[", modifiers: .command)
             Button("Search") { columns = .all; app.closePaneIfCompact(sizeClass == .compact); searching = true }
                 .keyboardShortcut("f", modifiers: .command)
-            Button("New Session") { Task { await app.newSession() } }.keyboardShortcut("n", modifiers: .command)
+            Button("New Session") { if app.connected { creating = true } }.keyboardShortcut("n", modifiers: .command)
             Button("Write a Message") { if app.stream != nil { composing = true } }.keyboardShortcut(.return, modifiers: .command)
             Button("Attach a Photo") { if app.stream != nil { photosShown = true } }.keyboardShortcut("o", modifiers: [.command, .shift])
             Button("Close Pane") { app.closePane() }.keyboardShortcut("w", modifiers: .command)
@@ -885,29 +956,67 @@ final class PanePreview: ObservableObject {
 }
 
 /// A longer message than the terminal line is good for, with dictation, sent as one paste.
+/// What you were writing stays if you close it, and what you sent lately is a tap away.
 struct ComposeView: View {
     let stream: BlockStream
+    let paneTitle: String?
     @AppStorage("composeEnter") private var pressEnter = true
-    @State private var text = ""
+    @AppStorage("composeDraft") private var text = ""
+    @AppStorage("composeRecent") private var recentJSON = "[]"
     @FocusState private var focused: Bool
     @Environment(\.dismiss) private var dismiss
 
+    /// Until there's history, the replies agents most often want.
+    private static let starters = ["continue", "yes, go ahead", "/compact"]
+
+    private var recent: [String] { (try? JSONDecoder().decode([String].self, from: Data(recentJSON.utf8))) ?? [] }
+
     var body: some View {
         NavigationStack {
-            Form {
-                TextEditor(text: $text).frame(minHeight: 160).focused($focused)
-                Toggle("Press Enter after sending", isOn: $pressEnter)
+            VStack(alignment: .leading, spacing: 12) {
+                TextEditor(text: $text)
+                    .focused($focused)
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .frame(minHeight: 140)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(recent.isEmpty ? Self.starters : recent, id: \.self) { phrase in
+                            Button { text = phrase } label: {
+                                Text(phrase).font(.subheadline).lineLimit(1)
+                                    .padding(.horizontal, 12).padding(.vertical, 7)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                Toggle("Press Enter after sending", isOn: $pressEnter).font(.subheadline)
+                Spacer(minLength: 0)
             }
-            .navigationTitle("Message")
+            .padding()
+            .navigationTitle(paneTitle.map { "To \($0)" } ?? "Message")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Send") { stream.sendText(text, enter: pressEnter); dismiss() }
-                        .disabled(text.isEmpty)
+                    Button("Send") { send() }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .onAppear { focused = true }
         }
+    }
+
+    private func send() {
+        stream.sendText(text, enter: pressEnter)
+        // Short messages are the ones worth sending again.
+        let sent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sent.count <= 120 {
+            let list = [sent] + recent.filter { $0 != sent }
+            recentJSON = String(decoding: (try? JSONEncoder().encode(Array(list.prefix(8)))) ?? Data("[]".utf8), as: UTF8.self)
+        }
+        text = ""
+        dismiss()
     }
 }

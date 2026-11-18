@@ -26,7 +26,8 @@ enum Status {
 /// The mark of the coding agent in a pane (Simple Icons, CC0), when there is one.
 struct AgentIcon: View {
     let agent: String
-    var size: CGFloat = 14
+    @ScaledMetric private var size: CGFloat
+    init(agent: String, size: CGFloat = 14) { self.agent = agent; _size = ScaledMetric(wrappedValue: size) }
 
     private static let assets = ["claude": "agent-claude", "codex": "agent-openai", "copilot": "agent-githubcopilot",
                                  "gemini": "agent-googlegemini", "opencode": "agent-opencode", "kimi": "agent-kimi"]
@@ -41,19 +42,20 @@ struct AgentIcon: View {
 /// A pane's status at a glance: pulses while working, a check when done, hollow when idle.
 struct StatusGlyph: View {
     let status: String
+    @ScaledMetric private var dot: CGFloat = 9   // grows with the text beside it
 
     var body: some View {
         Group {
             switch status {
-            case "done": Image(systemName: "checkmark.circle.fill").font(.system(size: 11, weight: .bold))
-            case "": Image(systemName: "circle").font(.system(size: 9, weight: .semibold))
+            case "done": Image(systemName: "checkmark.circle.fill").font(.system(size: dot * 1.2, weight: .bold))
+            case "": Image(systemName: "circle").font(.system(size: dot, weight: .semibold))
             default:
-                Image(systemName: "circle.fill").font(.system(size: 9))
+                Image(systemName: "circle.fill").font(.system(size: dot))
                     .symbolEffect(.pulse, isActive: status == "working")
             }
         }
         .foregroundStyle(status.isEmpty ? Color.secondary.opacity(0.5) : Status.color(status))
-        .frame(width: 14)
+        .frame(width: dot * 1.6)
     }
 }
 
@@ -61,13 +63,22 @@ struct StatusGlyph: View {
 struct ActivityLine: View {
     let detail: String
     let since: Date?
+    @Environment(\.dynamicTypeSize) private var type
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { _ in
-            HStack(spacing: 4) {
-                if !detail.isEmpty { Text(detail).lineLimit(1) }
-                if !detail.isEmpty && since != nil { Text("·") }
-                if let since { Text(since, format: .relative(presentation: .named, unitsStyle: .abbreviated)).fixedSize() }
+            // Large text: the activity gets lines of its own, and the time one below it.
+            if type.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 2) {
+                    if !detail.isEmpty { Text(detail).lineLimit(3) }
+                    if let since { Text(since, format: .relative(presentation: .named, unitsStyle: .abbreviated)) }
+                }
+            } else {
+                HStack(spacing: 4) {
+                    if !detail.isEmpty { Text(detail).lineLimit(1) }
+                    if !detail.isEmpty && since != nil { Text("·") }
+                    if let since { Text(since, format: .relative(presentation: .named, unitsStyle: .abbreviated)).fixedSize() }
+                }
             }
         }
         .font(.caption)
@@ -80,14 +91,16 @@ struct PaneLine: View {
     let pane: AppModel.Pane
     let muted: Bool
     let selected: Bool
+    @Environment(\.dynamicTypeSize) private var type
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             StatusGlyph(status: pane.status)
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     AgentIcon(agent: pane.agent)
-                    Text(pane.title).font(.body.weight(pane.status.isEmpty ? .regular : .medium)).lineLimit(1)
+                    Text(pane.title).font(.body.weight(pane.status.isEmpty ? .regular : .medium))
+                        .lineLimit(type.isAccessibilitySize ? 3 : 1)
                         .foregroundStyle(pane.status.isEmpty ? .secondary : .primary)
                 }
                 if !pane.detail.isEmpty || (pane.since != nil && !pane.status.isEmpty) {
@@ -100,6 +113,22 @@ struct PaneLine: View {
         .padding(.horizontal, 14).padding(.vertical, 10)
         .background(selected ? Color.accentColor.opacity(0.14) : .clear)
         .contentShape(Rectangle())
+        // One sentence for VoiceOver: "REVIEWER, working, reviewing the PR, 3 minutes ago".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(spoken)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var spoken: String {
+        var parts = [pane.title]
+        if !pane.agent.isEmpty { parts.append(pane.agent) }
+        parts.append(pane.status.isEmpty ? "idle" : Status.word(pane.status).lowercased())
+        if !pane.detail.isEmpty { parts.append(pane.detail) }
+        if let since = pane.since, !pane.status.isEmpty {
+            parts.append(since.formatted(.relative(presentation: .named, unitsStyle: .wide)))
+        }
+        if muted { parts.append("muted") }
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -110,8 +139,12 @@ struct SessionCard: View {
     let openPaneId: String?
     let onOpen: (AppModel.Pane) -> Void
     let onMute: (String, Bool) -> Void
+    var onRename: () -> Void = {}
+    var onClose: () -> Void = {}
+    var onClosePane: (AppModel.Pane) -> Void = { _ in }
     var searching = false
     @State private var showIdle = false
+    @Environment(\.dynamicTypeSize) private var type
 
     private var sessionMuted: Bool { mutedIDs.contains(session.id) }
 
@@ -134,24 +167,18 @@ struct SessionCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Text(session.label).font(.subheadline.weight(.semibold)).lineLimit(1)
-                Text(summary).font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(summary.contains("need") ? Color.red.opacity(0.15) : Color.secondary.opacity(0.12)))
-                    .foregroundStyle(summary.contains("need") ? .red : .secondary)
-                Spacer(minLength: 4)
-                if let host = session.host {
-                    Label(host, systemImage: "desktopcomputer").font(.caption2).foregroundStyle(.secondary)
-                }
-                if sessionMuted { Image(systemName: "bell.slash.fill").font(.caption).foregroundStyle(.secondary) }
-                Menu {
-                    Button { onMute(session.id, !sessionMuted) } label: {
-                        Label(sessionMuted ? "Unmute session" : "Mute session", systemImage: sessionMuted ? "bell" : "bell.slash")
+            // Large text: the name gets the width, with what's going on beneath it.
+            Group {
+                if type.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(session.label).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        HStack(spacing: 8) { headerDetails }
                     }
-                } label: {
-                    Image(systemName: "ellipsis").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-                        .frame(width: 28, height: 24).contentShape(Rectangle())
+                } else {
+                    HStack(spacing: 8) {
+                        Text(session.label).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        headerDetails
+                    }
                 }
             }
             .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
@@ -180,6 +207,29 @@ struct SessionCard: View {
 
 /// An agent waiting on you, at the top of the list: what it asks, and the way to answer.
 extension SessionCard {
+    @ViewBuilder private var headerDetails: some View {
+                Text(summary).font(.caption2.weight(.semibold))
+            .padding(.horizontal, 7).padding(.vertical, 2)
+            .background(Capsule().fill(summary.contains("need") ? Color.red.opacity(0.15) : Color.secondary.opacity(0.12)))
+            .foregroundStyle(summary.contains("need") ? .red : .secondary)
+        Spacer(minLength: 4)
+        if let host = session.host {
+            Label(host, systemImage: "desktopcomputer").font(.caption2).foregroundStyle(.secondary)
+        }
+        if sessionMuted { Image(systemName: "bell.slash.fill").font(.caption).foregroundStyle(.secondary) }
+        Menu {
+            Button { onMute(session.id, !sessionMuted) } label: {
+                Label(sessionMuted ? "Unmute session" : "Mute session", systemImage: sessionMuted ? "bell" : "bell.slash")
+            }
+            Button(action: onRename) { Label("Rename…", systemImage: "pencil") }
+            Divider()
+            Button(role: .destructive, action: onClose) { Label("Close Session…", systemImage: "xmark.circle") }
+        } label: {
+            Image(systemName: "ellipsis").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                .frame(width: 28, height: 24).contentShape(Rectangle())
+        }
+    }
+
     private func row(_ pane: AppModel.Pane) -> some View {
         let paneMuted = mutedIDs.contains(pane.id)
         return Button { onOpen(pane) } label: {
@@ -194,6 +244,8 @@ extension SessionCard {
                 Label(sessionMuted ? "Unmute \(session.label)" : "Mute \(session.label)",
                       systemImage: sessionMuted ? "bell" : "bell.slash")
             }
+            Divider()
+            Button(role: .destructive) { onClosePane(pane) } label: { Label("Close Pane…", systemImage: "xmark.square") }
         }
     }
 
@@ -560,6 +612,47 @@ struct UploadNote: View {
             .background(.regularMaterial, in: Capsule())
             .padding(.top, 8)
             .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+}
+
+/// Where a new session goes, and what it's called; the server picks a name if you don't.
+struct NewSessionView: View {
+    let hosts: [AppModel.HostState]
+    let onCreate: (String, String) -> Void
+    @State private var name = ""
+    @State private var host = "local"
+    @FocusState private var focused: Bool
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Name (optional)", text: $name)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .focused($focused).submitLabel(.go)
+                        .onSubmit { onCreate(host, name) }
+                } footer: {
+                    Text("A shell starts in it. Leave the name empty and the server picks one.")
+                }
+                if hosts.count > 1 {
+                    Section("Host") {
+                        Picker("Host", selection: $host) {
+                            ForEach(hosts) { h in Text(h.label).tag(h.id) }
+                        }
+                        .pickerStyle(.inline)
+                        .labelsHidden()
+                    }
+                }
+            }
+            .navigationTitle("New Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Create") { onCreate(host, name) } }
+            }
+            .onAppear { focused = true }
         }
     }
 }

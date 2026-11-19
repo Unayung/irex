@@ -190,9 +190,12 @@ struct SessionCard: View {
             } else {
                 ForEach(session.tabs) { tab in
                     if session.tabs.count > 1 {
-                        Text(tab.label.isEmpty ? "Tab" : tab.label)
-                            .font(.caption.weight(.semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
-                            .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 2)
+                        HStack(spacing: 6) {
+                            if tab.panes.count > 1 { PaneMap(tab: tab, current: openPaneId, width: 18) }
+                            Text(tab.label.isEmpty ? "Tab" : tab.label)
+                                .font(.caption.weight(.semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
+                        }
+                        .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 2)
                     }
                     ForEach(tab.panes) { row($0) }
                 }
@@ -308,8 +311,10 @@ struct NeedsYouCard: View {
 struct PaneHeader: View {
     @ObservedObject var stream: BlockStream
     let pane: AppModel.Pane?
+    let place: AppModel.Place?
     let compact: Bool
     let onBack: () -> Void
+    let onOverview: () -> Void
     let onCompose: () -> Void
     let onAttach: (AttachSource) -> Void
 
@@ -322,6 +327,14 @@ struct PaneHeader: View {
                     .frame(width: 32, height: 32).contentShape(Rectangle())
             }
             .accessibilityLabel(compact ? "Back" : "Show sessions")
+            if let place, place.count > 1 {
+                // Where this pane sits in its tab; tap for every tab and pane.
+                Button(action: onOverview) {
+                    PaneMap(tab: place.tab, current: place.pane.id, width: 24)
+                        .frame(width: 32, height: 32).contentShape(Rectangle())
+                }
+                .accessibilityLabel("All panes, \(place.position) of \(place.count)")
+            }
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     if let pane, !pane.status.isEmpty { StatusGlyph(status: pane.status) }
@@ -329,7 +342,8 @@ struct PaneHeader: View {
                     Text(pane?.title ?? "Pane").font(.subheadline.weight(.semibold)).lineLimit(1)
                 }
                 if let pane {
-                    Text(pane.detail.isEmpty ? pane.sessionLabel : "\(pane.sessionLabel) · \(pane.detail)")
+                    let tab = place.flatMap { $0.tabCount > 1 ? " · \($0.tab.label)" : nil } ?? ""
+                    Text(pane.sessionLabel + tab + (pane.detail.isEmpty ? "" : " · \(pane.detail)"))
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
@@ -404,7 +418,7 @@ struct ReplyOption: Identifiable {
 struct QuickReplyView: View {
     @ObservedObject var app: AppModel
     let pane: AppModel.Pane
-    let onOpen: () -> Void
+    let onOpen: (BlockStream?) -> Void
     @StateObject private var preview = PanePreview()
     @Environment(\.dismiss) private var dismiss
 
@@ -449,7 +463,7 @@ struct QuickReplyView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Open", action: onOpen) }
+                ToolbarItem(placement: .confirmationAction) { Button("Open") { onOpen(preview.take()) } }
             }
         }
         .onAppear { preview.start(app.watch(pane)) }
@@ -491,7 +505,8 @@ struct QuickReplyView: View {
 
 /// Beside the terminal during a sideways swipe: the pane letting go would open, or that there's none.
 struct SwipePreview: View {
-    let target: (pane: AppModel.Pane, position: Int, count: Int)?
+    let target: AppModel.Place?
+    let newTab: Bool     // letting go crosses into another tab
     let forward: Bool
     let armed: Bool
     let progress: CGFloat
@@ -504,11 +519,14 @@ struct SwipePreview: View {
                 .foregroundStyle(target == nil ? Color.secondary : Color.accentColor)
                 .symbolEffect(.bounce, value: armed)
             if let t = target {
+                if t.tab.panes.count > 1 || newTab { PaneMap(tab: t.tab, current: t.pane.id, width: 44).padding(.vertical, 2) }
                 HStack(spacing: 6) {
                     if !t.pane.status.isEmpty { StatusGlyph(status: t.pane.status) }
                     Text(t.pane.title).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.center)
                 }
-                Text("\(t.position) of \(t.count)").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                Text(newTab ? "\(t.tab.label) · \(t.position) of \(t.count)" : "\(t.position) of \(t.count)")
+                    .font(.caption2.monospacedDigit().weight(newTab ? .semibold : .regular))
+                    .foregroundStyle(newTab ? Color.accentColor : .secondary)
                 Text(armed ? "Release to open" : "Keep swiping").font(.caption2.weight(.medium))
                     .foregroundStyle(armed ? Color.accentColor : .secondary)
             } else {
@@ -518,7 +536,8 @@ struct SwipePreview: View {
         .padding(14)
         .frame(width: 150)
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
-            .fill(armed ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))
+            .fill(armed ? Color.accentColor.opacity(0.18) : .clear)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous)))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
             .strokeBorder(armed ? Color.accentColor : .clear, lineWidth: 1.5))
         .scaleEffect(0.85 + 0.15 * progress)
@@ -654,5 +673,188 @@ struct NewSessionView: View {
             }
             .onAppear { focused = true }
         }
+    }
+}
+
+/// Over a pane whose stream stopped: the program ended, or the connection to it went.
+struct StreamEnded: View {
+    @ObservedObject var stream: BlockStream
+    let onReconnect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        if let reason = stream.ended {
+            VStack(spacing: 10) {
+                Image(systemName: stream.exited ? "checkmark.circle" : "bolt.horizontal.circle")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(stream.exited ? Color.secondary : Color.orange)
+                Text(stream.exited ? "The program ended" : "Lost the connection to this pane")
+                    .font(.headline).multilineTextAlignment(.center)
+                if !reason.isEmpty {
+                    Text(reason).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center).lineLimit(3)
+                }
+                HStack(spacing: 10) {
+                    Button("Close", action: onClose).buttonStyle(.bordered)
+                    if !stream.exited { Button("Reconnect", action: onReconnect).buttonStyle(.borderedProminent) }
+                }
+                .padding(.top, 4)
+            }
+            .padding(20)
+            .frame(maxWidth: 320)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: .black.opacity(0.25), radius: 16, y: 6)
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black.opacity(0.25))
+            .transition(.opacity)
+        }
+    }
+}
+
+/// The pane side with no pane open (iPad): where things stand, and the keys that get around.
+struct DetailPlaceholder: View {
+    let connected: Bool
+    let summary: String
+    let hasSessions: Bool
+
+    private let keys: [(String, String)] = [("⌘ [  ⌘ ]", "Previous and next pane"), ("⌘ F", "Search"),
+                                             ("⌘ N", "New session"), ("⌘ ↩", "Write a message"), ("⌘ \\", "All panes"), ("⌘ W", "Close the pane")]
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            AppMark(size: 64).opacity(connected ? 1 : 0.5)
+            Text(!connected ? "Not connected" : hasSessions ? "Pick a pane" : "No sessions yet")
+                .font(.title3.weight(.semibold))
+            Text(!connected ? "Connect to a Rex server in Settings." : summary.isEmpty ? "Choose one from the list." : summary)
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if connected {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                    ForEach(keys, id: \.0) { k in
+                        GridRow {
+                            Text(k.0).font(.footnote.monospaced().weight(.semibold)).gridColumnAlignment(.trailing)
+                            Text(k.1).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(16)
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.top, 10)
+                .accessibilityElement(children: .combine)
+            }
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemGroupedBackground))
+    }
+}
+
+/// A tab's split drawn small: where each pane sits, the one you're on filled in, one waiting on you in red.
+struct PaneMap: View {
+    let tab: AppModel.Tab
+    var current: String?
+    var width: CGFloat = 22
+
+    var body: some View {
+        let height = width / 1.6   // about a desktop window's shape
+        let gap = max(1, width * 0.06)
+        ZStack(alignment: .topLeading) {
+            ForEach(tab.panes) { p in
+                RoundedRectangle(cornerRadius: max(1, width * 0.05), style: .continuous)
+                    .fill(p.id == current ? Color.accentColor : p.status == "blocked" ? Color.red : Color.secondary.opacity(0.35))
+                    .frame(width: max(2, p.rect.width * width - gap), height: max(2, p.rect.height * height - gap))
+                    .offset(x: p.rect.minX * width + gap / 2, y: p.rect.minY * height + gap / 2)
+            }
+        }
+        .frame(width: width, height: height, alignment: .topLeading)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Every tab of a session drawn as its split, each pane with its latest output, like a tab grid.
+/// Tapping a pane goes there.
+struct PaneOverview: View {
+    @ObservedObject var app: AppModel
+    let sessionId: String
+    let onPick: (AppModel.Pane, BlockStream?) -> Void
+    @StateObject private var previews = PanePreviews()
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let session = app.sessions.first { $0.id == sessionId }
+        NavigationStack {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 16)], alignment: .leading, spacing: 20) {
+                    ForEach(session?.tabs ?? []) { tab in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(tab.label).font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                                Spacer()
+                                Text(tab.panes.count == 1 ? "1 pane" : "\(tab.panes.count) panes").font(.caption2).foregroundStyle(.tertiary)
+                            }
+                            GeometryReader { g in
+                                ForEach(tab.panes) { p in region(p, in: g.size) }
+                            }
+                            .aspectRatio(1.6, contentMode: .fit)
+                        }
+                    }
+                }
+                .padding()
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle(session?.label ?? "Panes")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .onAppear { previews.start(session?.tabs.flatMap(\.panes) ?? [], app: app) }
+        .onDisappear { previews.stop() }
+        #if DEBUG
+        // `-overviewPick <n>` with `-showOverview YES`: taps the nth pane, for simulator checks.
+        .task {
+            let n = UserDefaults.standard.integer(forKey: "overviewPick")
+            guard n > 0 else { return }
+            try? await Task.sleep(for: .seconds(4))
+            if let p = session?.tabs.flatMap(\.panes).dropFirst(n - 1).first { onPick(p, previews.take(p.id)) }
+        }
+        #endif
+    }
+
+    private func region(_ p: AppModel.Pane, in size: CGSize) -> some View {
+        let gap: CGFloat = 5
+        let w = max(10, p.rect.width * size.width - gap), h = max(10, p.rect.height * size.height - gap)
+        let here = p.id == app.openPaneId
+        // As many of the latest lines as fit under the title and the agent's note.
+        let rows = max(0, Int((h - (p.detail.isEmpty ? 30 : 52)) / 9))
+        return Button { onPick(p, previews.take(p.id)) } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    if !p.status.isEmpty { StatusGlyph(status: p.status) }
+                    AgentIcon(agent: p.agent)
+                    Text(p.title).font(.caption2.weight(.semibold)).lineLimit(1)
+                }
+                .foregroundStyle(.white)
+                if !p.detail.isEmpty {
+                    Text(p.detail).font(.system(size: 9)).foregroundStyle(.white.opacity(0.75)).lineLimit(2)
+                }
+                Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(previews.lines[p.id, default: []].suffix(rows).enumerated()), id: \.offset) { _, line in
+                        Text(line).lineLimit(1).frame(height: 9)
+                    }
+                }
+                .font(.system(size: 7, design: .monospaced)).foregroundStyle(.white.opacity(0.55))
+            }
+            .padding(7)
+            .frame(width: w, height: h, alignment: .topLeading)
+            .background(Color(red: 0.07, green: 0.09, blue: 0.15), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(here ? Color.accentColor : p.status == "blocked" ? .red : .clear, lineWidth: 2))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .offset(x: p.rect.minX * size.width + gap / 2, y: p.rect.minY * size.height + gap / 2)
+        .accessibilityLabel("\(p.title)\(here ? ", open now" : "")\(p.detail.isEmpty ? "" : ", \(p.detail)")")
     }
 }

@@ -36,6 +36,12 @@ struct RexError: Error, CustomStringConvertible {
     let description: String
 }
 
+/// An error as a person reads it: the system's sentence for network trouble, not the NSError dump.
+func describe(_ error: Error) -> String {
+    if let e = error as? RexError { return e.description }
+    return (error as NSError).localizedDescription
+}
+
 /// Control connection (`/api/control`, `rex.control.v1`): hello/welcome, request/response by id, events.
 @MainActor
 final class RexControl {

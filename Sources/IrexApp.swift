@@ -23,6 +23,7 @@ final class AppModel: ObservableObject {
         let detail: String   // what the agent says it's doing
         let since: Date?     // when its status last changed
         let agent: String    // the coding agent in front, such as claude, or ""
+        let rect: CGRect     // where it sits in its tab, 0–1 each way
     }
     struct Tab: Identifiable { let id: String; let label: String; let panes: [Pane] }
     struct Session: Identifiable { let id: String; let label: String; let host: String?; let tabs: [Tab] }
@@ -58,13 +59,16 @@ final class AppModel: ObservableObject {
         hostOrder.flatMap { host in
             (hostSessions[host] ?? []).map { s in
                 let windows = views[s.id]?["windows"] as? [[String: Any]] ?? []
-                return Session(id: s.id, label: s.label, host: host == "local" ? nil : hostLabels[host], tabs: windows.map { w in
-                    let blocks = (w["layers"] as? [[String: Any]] ?? []).flatMap { $0["blocks"] as? [[String: Any]] ?? [] }
-                    return Tab(id: w["window_id"] as? String ?? "", label: w["label"] as? String ?? "", panes: blocks.compactMap { b in
+                return Session(id: s.id, label: s.label, host: host == "local" ? nil : hostLabels[host], tabs: windows.enumerated().map { i, w in
+                    let blocks = (w["layers"] as? [[String: Any]] ?? []).flatMap(Self.placed)
+                    // The server names an unnamed tab after its ID ("Window 4bf251ab"); its place reads better.
+                    let label = w["label"] as? String ?? ""
+                    let named = label.range(of: #"^Window [0-9a-fA-F]{6,}$"#, options: .regularExpression) == nil
+                    return Tab(id: w["window_id"] as? String ?? "", label: named && !label.isEmpty ? label : "Tab \(i + 1)", panes: blocks.compactMap { b, rect in
                         guard let id = b["block_id"] as? String else { return nil }
                         let title = titles[id].flatMap { $0.isEmpty ? nil : $0 } ?? b["label"] as? String ?? "Pane"
                         return Pane(id: id, sessionId: s.id, sessionLabel: s.label, title: title, status: statuses[id] ?? "",
-                                    detail: details[id] ?? "", since: since[id], agent: agents[id] ?? "")
+                                    detail: details[id] ?? "", since: since[id], agent: agents[id] ?? "", rect: rect)
                     })
                 })
             }
@@ -94,11 +98,53 @@ final class AppModel: ObservableObject {
 
     private func control(for sessionId: String) -> RexControl? { sessionHost[sessionId].flatMap { controls[$0] } }
 
+    /// A layer's blocks in the order its splits give (before, then after: down a column, then the
+    /// next one), each with its place in the tab. Blocks outside the split tree take the layer's bounds.
+    private static func placed(_ layer: [String: Any]) -> [(block: [String: Any], rect: CGRect)] {
+        func leaves(_ node: [String: Any]?) -> [(id: String, rect: CGRect)] {
+            guard let node else { return [] }
+            if let id = node["block_id"] as? String { return [(id, rect(node["rect"]))] }
+            let split = node["split"] as? [String: Any]
+            return leaves(split?["before"] as? [String: Any]) + leaves(split?["after"] as? [String: Any])
+        }
+        let blocks = layer["blocks"] as? [[String: Any]] ?? []
+        let tree = leaves(layer["layout"] as? [String: Any])
+        let inTree = tree.compactMap { t in blocks.first { $0["block_id"] as? String == t.id }.map { ($0, t.rect) } }
+        let rest = blocks.filter { b in !tree.contains { $0.id == b["block_id"] as? String } }
+        return inTree + rest.map { ($0, rect(layer["bounds"])) }
+    }
+
+    private static func rect(_ value: Any?) -> CGRect {
+        guard let r = value as? [Double], r.count == 4 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        return CGRect(x: r[0], y: r[1], width: r[2], height: r[3])
+    }
+
+    /// Where a pane is: its tab, and its place among the session's panes.
+    struct Place {
+        let pane: Pane
+        let tab: Tab
+        let tabIndex: Int
+        let tabCount: Int
+        let position: Int   // 1-based, through every tab
+        let count: Int
+    }
+
+    func place(_ blockId: String) -> Place? {
+        for s in sessions {
+            guard let ti = s.tabs.firstIndex(where: { $0.panes.contains { $0.id == blockId } }) else { continue }
+            let panes = s.tabs.flatMap(\.panes)
+            guard let i = panes.firstIndex(where: { $0.id == blockId }) else { return nil }
+            return Place(pane: panes[i], tab: s.tabs[ti], tabIndex: ti, tabCount: s.tabs.count, position: i + 1, count: panes.count)
+        }
+        return nil
+    }
+
     // MARK: connecting
 
     func connect(_ address: String) async {
         let hadList = !(hostSessions["local"] ?? []).isEmpty
         disconnect(keepList: hadList)
+        if let w = wanted { openWhenListed(w.block) }   // a fresh wait, counted from this attempt
         guard let ep = RexEndpoint(address) else { status = "That isn't a server address."; return }
         status = ""
         connecting = true
@@ -107,7 +153,7 @@ final class AppModel: ObservableObject {
         let ok = await connectHost("local", endpoint: ep)
         connecting = false
         reconnecting = false
-        guard ok else { disconnect(); return }
+        guard ok else { wanted = nil; disconnect(); return }
         connected = true
         await refreshHosts()
         #if DEBUG
@@ -138,14 +184,16 @@ final class AppModel: ObservableObject {
             // A newer connect() cancels this one (-999); don't let it overwrite that attempt's state.
             guard controls[key] === c else { return false }
             controls[key] = nil
-            if key == "local" { status = "\(error)" } else { hostProblems[key] = "\(error)" }
+            if key == "local" { status = describe(error) } else { hostProblems[key] = describe(error) }
             return false
         }
     }
 
     private func hostClosed(_ key: String, _ reason: String) {
         controls[key] = nil
-        if let open = stream?.sessionId, sessionHost[open] == key { closePane() }
+        // Stay on the pane: it opens again once the host is back (a phone drops sockets in the background).
+        let keep = stream.flatMap { sessionHost[$0.sessionId] == key ? $0.blockId : nil }
+        if let keep { stream?.stop(); stream = nil; openWhenListed(keep) }
         if key == "local" {
             // Without the first server there's no host list either; the next connect starts over,
             // with the old list up until the new one lands.
@@ -293,29 +341,48 @@ final class AppModel: ObservableObject {
 
     // MARK: panes
 
-    func open(_ p: Pane) async {
-        guard let c = control(for: p.sessionId), stream?.blockId != p.id else { return }
+    /// Opens a pane. `watched` is a stream a preview already has for it: the server gives a second
+    /// stream for the same pane nothing, so that one is taken over instead.
+    func open(_ p: Pane, reusing watched: BlockStream? = nil) async {
+        guard let c = control(for: p.sessionId), stream?.blockId != p.id else { watched?.stop(); return }
         stream?.stop(); stream = nil
         openPaneId = p.id   // right away, so the iPhone pushes the terminal without waiting for the server
+        if let w = watched {
+            if w.blockId == p.id && w.ended == nil {
+                w.fitOnOpen = UserDefaults.standard.object(forKey: "fitOnOpen") as? Bool ?? true
+                stream = w
+                status = ""
+                await w.claim(.streamStart)
+                return
+            }
+            w.stop()
+        }
         do {
             try await c.call("session.attach", ["session_id": p.sessionId])
             guard openPaneId == p.id else { return }
             let bs = BlockStream(control: c, sessionId: p.sessionId, blockId: p.id, terminal: TerminalModel())
             bs.fitOnOpen = UserDefaults.standard.object(forKey: "fitOnOpen") as? Bool ?? true
-            bs.onEnded = { [weak self] reason in self?.status = "Stream ended: \(reason)" }
             stream = bs
             status = ""
         } catch {
-            status = "\(error)"
+            status = describe(error)
+            if openPaneId == p.id { openPaneId = nil }   // no pane screen without a pane, nor a way back from it
         }
     }
 
+    /// Opens the open pane over again: after its stream dropped, or once the connection is back.
+    func reopen() {
+        guard let id = openPaneId else { return }
+        stream?.stop(); stream = nil
+        openWhenListed(id)
+    }
+
     /// The pane before (-1) or after (+1) the open one, through the session's tabs in order.
-    func neighbor(_ delta: Int) -> (pane: Pane, position: Int, count: Int)? {
+    func neighbor(_ delta: Int) -> Place? {
         guard let s = stream, let session = sessions.first(where: { $0.id == s.sessionId }) else { return nil }
         let panes = session.tabs.flatMap(\.panes)
         guard let i = panes.firstIndex(where: { $0.id == s.blockId }), panes.indices.contains(i + delta) else { return nil }
-        return (panes[i + delta], i + delta + 1, panes.count)
+        return place(panes[i + delta].id)
     }
 
     func openNeighbor(_ delta: Int) {
@@ -345,11 +412,17 @@ final class AppModel: ObservableObject {
         openWanted()
         Task {
             try? await Task.sleep(for: .seconds(30))
-            guard wanted?.block == block else { return }
+            // A newer wait for it (a reconnect) has its own 30 seconds.
+            // Asleep in the background it waits; waking, the reconnect starts a new wait.
+            guard let w = wanted, w.block == block, Date.now.timeIntervalSince(w.at) >= 29,
+                  UIApplication.shared.applicationState == .active else { return }
             wanted = nil
             if stream == nil && openPaneId == block { openPaneId = nil; status = "That pane is no longer there." }
         }
     }
+
+    /// Stops waiting for a pane and goes back to the list.
+    func cancelOpening() { wanted = nil; closePane() }
 
     /// The pane irex is waiting to open, if any.
     var opening: Bool { wanted != nil && stream == nil }
@@ -358,7 +431,7 @@ final class AppModel: ObservableObject {
         guard let w = wanted else { return }
         // A pane that never shows up (closed meanwhile) shouldn't open by surprise later.
         guard Date.now.timeIntervalSince(w.at) < 30 else { return }
-        guard let p = pane(w.block) else { return }
+        guard let p = pane(w.block), control(for: p.sessionId) != nil else { return }
         wanted = nil
         Task { await open(p) }
     }
@@ -387,7 +460,7 @@ final class AppModel: ObservableObject {
             await fetchView(id)
             if let p = sessions.first(where: { $0.id == id })?.tabs.first?.panes.first { await open(p) }
         } catch {
-            status = "\(error)"
+            status = describe(error)
         }
     }
 
@@ -396,21 +469,21 @@ final class AppModel: ObservableObject {
         do {
             try await c.call("session.set_label", ["session_id": sessionId, "label": label.trimmingCharacters(in: .whitespaces)])
             if let l = try? await c.call("session.list") { setSessions(host, l) }
-        } catch { status = "\(error)" }
+        } catch { status = describe(error) }
     }
 
     /// Ends a session and every program in it, on whichever host has it.
     func closeSession(_ sessionId: String) async {
         guard let c = control(for: sessionId) else { return }
         if stream?.sessionId == sessionId { closePane() }
-        do { try await c.call("session.destroy", ["session_id": sessionId]) } catch { status = "\(error)" }
+        do { try await c.call("session.destroy", ["session_id": sessionId]) } catch { status = describe(error) }
     }
 
     /// Closes one pane, hanging up the program in it, as closing a terminal does.
     func closeBlock(_ p: Pane) async {
         guard let c = control(for: p.sessionId) else { return }
         if stream?.blockId == p.id { closePane() }
-        do { try await c.call("block.close", ["session_id": p.sessionId, "block_id": p.id]) } catch { status = "\(error)" }
+        do { try await c.call("block.close", ["session_id": p.sessionId, "block_id": p.id]) } catch { status = describe(error) }
     }
 
     /// On iPhone the list and the pane share the screen, so searching the list leaves the pane.
@@ -436,6 +509,7 @@ struct ContentView: View {
     @State private var settingsShown = false
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
+    @State private var overviewShown = false
     @State private var query = ""
     @State private var renaming: AppModel.Session?
     @State private var newName = ""
@@ -518,9 +592,11 @@ struct ContentView: View {
                     ContentUnavailableView {
                         Label(app.connected ? "No sessions" : "Not connected", systemImage: app.connected ? "terminal" : "network.slash")
                     } description: {
-                        Text(app.connected ? "Start one with rex new on the server." : app.status)
+                        Text(app.connected ? "A session holds your shells and agents. Start one here or with rex new." : app.status)
                     } actions: {
-                        if !app.connected {
+                        if app.connected {
+                            Button("New Session") { creating = true }.buttonStyle(.borderedProminent)
+                        } else {
                             Button("Try again") { Task { await app.connect(server) } }.buttonStyle(.borderedProminent)
                             Button("Settings") { settingsShown = true }
                         }
@@ -555,8 +631,9 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let s = app.stream {
-                    PaneHeader(stream: s, pane: app.pane(s.blockId), compact: sizeClass == .compact,
+                    PaneHeader(stream: s, pane: app.pane(s.blockId), place: app.place(s.blockId), compact: sizeClass == .compact,
                                onBack: { if sizeClass == .compact { app.closePane() } else { columns = columns == .detailOnly ? .all : .detailOnly } },
+                               onOverview: { overviewShown = true },
                                onCompose: { composing = true },
                                onAttach: { source in
                                    switch source {
@@ -583,7 +660,8 @@ struct ContentView: View {
                         .background(Color(.systemGroupedBackground))
                         .overlay(alignment: swipeDX < 0 ? .trailing : .leading) {
                             if swipeDX != 0 {
-                                SwipePreview(target: app.neighbor(swipeDX < 0 ? 1 : -1), forward: swipeDX < 0,
+                                let target = app.neighbor(swipeDX < 0 ? 1 : -1)
+                                SwipePreview(target: target, newTab: crossesTab(target), forward: swipeDX < 0,
                                              armed: swipeArmed, progress: min(1, abs(swipeDX) / Self.swipeThreshold))
                                     .padding(.horizontal, 12)
                                     // Comes in from the edge with the finger, settled by the threshold.
@@ -592,6 +670,7 @@ struct ContentView: View {
                         }
                         .clipped()
                         .overlay(alignment: .top) { UploadNote(stream: s) }
+                        .overlay { StreamEnded(stream: s, onReconnect: { app.reopen() }, onClose: { app.closePane() }) }
                         .overlay(alignment: .bottomTrailing) {
                             if scrolledBack {
                                 // Back to what the program is doing now.
@@ -608,22 +687,29 @@ struct ContentView: View {
                         }
                         .animation(.snappy, value: scrolledBack)
                         .animation(.snappy, value: s.uploadNote)
+                        .animation(.easeOut(duration: 0.2), value: s.ended)
                 } else if app.opening {
-                    Spacer(); ProgressView("Opening…"); Spacer()
+                    Spacer()
+                    ProgressView(app.connected ? "Opening…" : "Reconnecting…")
+                    Button("Cancel") { app.cancelOpening() }.buttonStyle(.bordered).padding(.top, 12)
+                    Spacer()
                 } else {
-                    ContentUnavailableView(app.sessions.isEmpty ? "Not connected" : "Pick a pane",
-                                           systemImage: app.sessions.isEmpty ? "network.slash" : "terminal",
-                                           description: Text(app.sessions.isEmpty ? "Connect to a Rex server in Settings." : "Choose one from the list."))
+                    DetailPlaceholder(connected: app.connected, summary: app.summary, hasSessions: !app.sessions.isEmpty)
                 }
-                if !app.status.isEmpty {
+                if !app.status.isEmpty && app.connected {   // disconnected, the list says why
                     Text(app.status).font(.footnote).foregroundStyle(.secondary).padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
         }
         .sheet(item: $replyTo) { p in
-            QuickReplyView(app: app, pane: p, onOpen: { replyTo = nil; Task { await app.open(p) } })
+            QuickReplyView(app: app, pane: p, onOpen: { s in replyTo = nil; Task { await app.open(p, reusing: s) } })
                 .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $overviewShown) {
+            if let s = app.stream {
+                PaneOverview(app: app, sessionId: s.sessionId) { p, watched in overviewShown = false; Task { await app.open(p, reusing: watched) } }
+            }
         }
         .sheet(isPresented: $composing) {
             if let s = app.stream { ComposeView(stream: s, paneTitle: app.pane(s.blockId)?.title).presentationDetents([.medium, .large]) }
@@ -705,6 +791,10 @@ struct ContentView: View {
             // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
             if UserDefaults.standard.bool(forKey: "showSettings") { settingsShown = true }
             if UserDefaults.standard.bool(forKey: "showNewSession") { creating = true }
+            if UserDefaults.standard.bool(forKey: "showOverview") {
+                try? await Task.sleep(for: .seconds(5))
+                overviewShown = app.stream != nil
+            }
             if UserDefaults.standard.bool(forKey: "showCompose") {
                 try? await Task.sleep(for: .seconds(5))
                 composing = app.stream != nil
@@ -763,7 +853,10 @@ struct ContentView: View {
                 if !server.isEmpty { Task { await app.connect(server) } }
             } else {
                 Task { await app.refreshHosts() }
-                if let s = app.stream { Task { await s.claim(.sceneActive) } }
+                if let s = app.stream {
+                    // Back from the background with the pane's stream gone: pick it up again.
+                    if s.ended != nil && !s.exited { app.reopen() } else { Task { await s.claim(.sceneActive) } }
+                }
             }
             push.loadMutes()
         }
@@ -842,6 +935,7 @@ extension ContentView {
             Button("Search") { columns = .all; app.closePaneIfCompact(sizeClass == .compact); searching = true }
                 .keyboardShortcut("f", modifiers: .command)
             Button("New Session") { if app.connected { creating = true } }.keyboardShortcut("n", modifiers: .command)
+            Button("All Panes") { if app.stream != nil { overviewShown = true } }.keyboardShortcut("\\", modifiers: .command)
             Button("Write a Message") { if app.stream != nil { composing = true } }.keyboardShortcut(.return, modifiers: .command)
             Button("Attach a Photo") { if app.stream != nil { photosShown = true } }.keyboardShortcut("o", modifiers: [.command, .shift])
             Button("Close Pane") { app.closePane() }.keyboardShortcut("w", modifiers: .command)
@@ -850,6 +944,12 @@ extension ContentView {
         .opacity(0)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+
+    /// Whether `target` is in a different tab from the open pane.
+    func crossesTab(_ target: AppModel.Place?) -> Bool {
+        guard let target, let s = app.stream else { return false }
+        return app.place(s.blockId)?.tab.id != target.tab.id
     }
 
     /// Sessions whose name matches the search, whole; otherwise the panes that match, by title or activity.
@@ -876,7 +976,9 @@ extension ContentView {
             let armed = target != nil && abs(dx) > Self.swipeThreshold
             if armed != swipeArmed {
                 swipeArmed = armed
-                UISelectionFeedbackGenerator().selectionChanged()
+                // Into another tab is a bigger step; it feels like one.
+                if armed && crossesTab(target) { UIImpactFeedbackGenerator(style: .rigid).impactOccurred() }
+                else { UISelectionFeedbackGenerator().selectionChanged() }
             }
         case .ended(let dx, let velocity):
             let delta = dx < 0 ? 1 : -1
@@ -953,6 +1055,61 @@ final class PanePreview: ObservableObject {
     }
 
     func stop() { stream?.stop(); stream = nil }
+
+    /// Hands over the stream, to open the pane on it.
+    func take() -> BlockStream? {
+        let s = stream
+        stream = nil
+        s?.terminal.onChange = nil
+        return s
+    }
+}
+
+/// The latest lines of several panes at once, for the overview, each on a stream that only watches.
+@MainActor
+final class PanePreviews: ObservableObject {
+    @Published private(set) var lines: [String: [String]] = [:]
+    private var streams: [String: BlockStream] = [:]
+    private var dirty = Set<String>()
+
+    func start(_ panes: [AppModel.Pane], app: AppModel) {
+        // ponytail: previews for the first 12 panes; past that, title and status only.
+        for p in panes.prefix(12) where streams[p.id] == nil {
+            // The open pane has its stream already, and a second one for it gets nothing:
+            // what it showed a moment ago will do.
+            if let open = app.stream, open.blockId == p.id { lines[p.id] = Self.latest(open.terminal); continue }
+            guard let s = app.watch(p) else { continue }
+            streams[p.id] = s
+            s.terminal.onChange = { [weak self] in self?.changed(p.id) }
+        }
+    }
+
+    func stop() { streams.values.forEach { $0.stop() }; streams = [:] }
+
+    /// Hands over a pane's stream, to open the pane on it.
+    func take(_ id: String) -> BlockStream? {
+        let s = streams.removeValue(forKey: id)
+        s?.terminal.onChange = nil
+        return s
+    }
+
+    /// A busy pane draws many times a second; read the screens a few times a second instead.
+    private func changed(_ id: String) {
+        let idle = dirty.isEmpty
+        dirty.insert(id)
+        guard idle else { return }
+        Task {
+            try? await Task.sleep(for: .milliseconds(250))
+            for id in dirty {
+                if let t = streams[id]?.terminal { lines[id] = Self.latest(t) }
+            }
+            dirty = []
+        }
+    }
+
+    private static func latest(_ t: TerminalModel) -> [String] {
+        Array(t.lastLines(60).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(16))
+    }
 }
 
 /// A longer message than the terminal line is good for, with dictation, sent as one paste.

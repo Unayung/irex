@@ -18,7 +18,9 @@ final class BlockStream: ObservableObject {
     let sessionId: String
     let blockId: String
     let terminal: TerminalModel
-    var onEnded: ((String) -> Void)?
+    /// Why the stream stopped by itself, if it did; `exited` when the program in the pane ended.
+    @Published private(set) var ended: String?
+    @Published private(set) var exited = false
     /// Whether irex sizes this pane. Until it does, the pane keeps the owner's size and irex
     /// shows it scaled down, so watching from a phone doesn't reflow it on the Mac.
     @Published private(set) var owning = false
@@ -31,6 +33,7 @@ final class BlockStream: ObservableObject {
     private let control: RexControl
     private let session = URLSession(configuration: .default)
     private var task: URLSessionWebSocketTask?
+    private var started = false
 
     private enum Phase { case handshake, snapshot, live }
     private var phase = Phase.handshake
@@ -48,6 +51,9 @@ final class BlockStream: ObservableObject {
     }
 
     func start() async {
+        // A stream handed over from a preview is going already.
+        guard !started else { return }
+        started = true
         do {
             let r = try await control.call("data.connect", ["session_id": sessionId, "block_id": blockId,
                                                            "data_ref_id": "terminal", "subprotocol": "rex.data.terminal.v1"])
@@ -62,7 +68,7 @@ final class BlockStream: ObservableObject {
             receiveLoop(t)
             await claim(.streamStart)
         } catch {
-            end("\(error)")
+            end(describe(error))
         }
     }
 
@@ -144,7 +150,7 @@ final class BlockStream: ObservableObject {
         var problem: String?
         for (i, f) in files.enumerated() {
             do { try await upload(f, batch: batch, index: i, count: files.count) } catch {
-                problem = "\(f.name) couldn't be attached: \(error)"
+                problem = "\(f.name) couldn't be attached: \(describe(error))"
             }
         }
         uploadFailed = problem != nil
@@ -281,14 +287,15 @@ final class BlockStream: ObservableObject {
         case "theme":
             terminal.setTheme(m)
         case "child_exited":
-            end("process exited (\(m["exit_code"] ?? "?"))")
+            exited = true
+            end(m["exit_code"].map { "exit code \($0)" } ?? "")
         default: break
         }
     }
 
     private func end(_ reason: String) {
         task = nil
-        onEnded?(reason)
+        ended = reason
     }
 
     static func base64url(_ s: String) -> Data? {

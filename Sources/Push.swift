@@ -64,6 +64,13 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
             Task { await other.end(nil, dismissalPolicy: .immediate) }
         }
         Task { for await data in activity.pushTokenUpdates { activityToken = data.hex; send() } }
+        // Ended by iOS (eight hours at most) or swiped away: say so, so irex-push starts another.
+        Task {
+            for await state in activity.activityStateUpdates where state == .ended || state == .dismissed {
+                activityToken = nil
+                send()
+            }
+        }
     }
 
     func gotDeviceToken(_ data: Data) {
@@ -73,10 +80,15 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
 
     func failed(_ error: Error) { state = "No push token: \(error.localizedDescription)" }
 
-    private func send() {
+    /// Tells irex-push this device's tokens, and whether a Live Activity is still up.
+    func send() {
         guard let relay, let deviceToken else { return }
         var body: [String: Any] = ["token": deviceToken, "env": env]
         if let startToken { body["start_token"] = startToken }
+        if !Activity<AgentsAttributes>.activities.contains(where: { $0.activityState == .active }) {
+            activityToken = nil
+            body["no_activity"] = true   // it ended while irex wasn't running
+        }
         if let activityToken { body["activity_token"] = activityToken }
         var req = URLRequest(url: relay.appending(path: "register"))
         req.httpMethod = "POST"
@@ -159,6 +171,10 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
                 .padding(.horizontal, 14).padding(.vertical, 16)
                 .frame(width: 370)
                 .background(.black, in: RoundedRectangle(cornerRadius: 44, style: .continuous))
+                WatchStack(state: state)   // the Apple Watch Smart Stack, about a 45mm card
+                    .padding(10)
+                    .frame(width: 184, height: 92)
+                    .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                 HStack {
                     Mark()
                     Spacer()

@@ -92,3 +92,40 @@ func TestSummaryEndpoint(t *testing.T) {
 		t.Fatalf("POST answered %d", post.Code)
 	}
 }
+
+func TestOldActivityIsReplaced(t *testing.T) {
+	now := time.Now()
+	fresh := &device{ActivityToken: "ab", ActivityStart: now.Add(-time.Hour)}
+	old := &device{ActivityToken: "ab", ActivityStart: now.Add(-8 * time.Hour)}
+	unknown := &device{ActivityToken: "ab"} // registered before irex-push kept the start time
+	none := &device{}
+	if fresh.stale(now) || !old.stale(now) || !unknown.stale(now) || none.stale(now) {
+		t.Fatal("stale")
+	}
+}
+
+func TestRegisterKeepsActivityAge(t *testing.T) {
+	s := &server{cfg: config{state: t.TempDir()}, devices: map[string]*device{}, dirty: make(chan struct{}, 1)}
+	token := strings.Repeat("ab", 32)
+	reg := func(body string) {
+		rec := httptest.NewRecorder()
+		s.register(rec, httptest.NewRequest("POST", "/register", strings.NewReader(body)))
+		if rec.Code != 204 {
+			t.Fatalf("register answered %d", rec.Code)
+		}
+	}
+	act := strings.Repeat("cd", 32)
+	reg(`{"token":"` + token + `","env":"sandbox","activity_token":"` + act + `"}`)
+	first := s.devices[token].ActivityStart
+	if first.IsZero() {
+		t.Fatal("no start time")
+	}
+	reg(`{"token":"` + token + `","env":"sandbox","activity_token":"` + act + `"}`) // the same one again
+	if !s.devices[token].ActivityStart.Equal(first) {
+		t.Fatal("re-registering the same activity reset its age")
+	}
+	reg(`{"token":"` + token + `","env":"sandbox","no_activity":true}`)
+	if s.devices[token].ActivityToken != "" {
+		t.Fatal("an ended activity kept its token")
+	}
+}

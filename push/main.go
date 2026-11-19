@@ -159,8 +159,19 @@ type device struct {
 	Env           string    `json:"env"`                      // sandbox or production
 	StartToken    string    `json:"start_token,omitempty"`    // starts the Live Activity by push
 	ActivityToken string    `json:"activity_token,omitempty"` // updates the one that's running
+	ActivityStart time.Time `json:"activity_start,omitempty"` // when that one started
+	NoActivity    bool      `json:"no_activity,omitempty"`    // from irex: none is running (ended, or swiped away)
 	Updated       time.Time `json:"updated"`
 	started       time.Time // when irex-push last asked this device to start the Live Activity
+}
+
+// iOS ends a Live Activity after eight hours and tells no one; updates to it then go nowhere,
+// without an error. Before that, irex-push ends it and starts a fresh one.
+const activityLife = 7*time.Hour + 30*time.Minute
+
+// stale says the device's Live Activity is too old to keep updating (or of unknown age).
+func (d *device) stale(now time.Time) bool {
+	return d.ActivityToken != "" && now.Sub(d.ActivityStart) > activityLife
 }
 
 // ---- agents
@@ -601,7 +612,16 @@ func (s *server) liveActivity(event string, c contentState, urgent bool) {
 	s.each(func(d *device) error {
 		s.mu.Lock()
 		start, act := d.StartToken, d.ActivityToken
-		s.mu.Unlock()
+		if d.stale(time.Now()) {
+			// Replace it: end the old one, and the start below brings a new one.
+			old := act
+			d.ActivityToken, act = "", ""
+			s.saveDevices()
+			s.mu.Unlock()
+			_ = s.push.send(d.Env, old, "liveactivity", priority, payload("end"))
+		} else {
+			s.mu.Unlock()
+		}
 		token, ev := act, event
 		if event == "start" || (act == "" && event == "update") {
 			// No activity of ours on this device yet: start one, but only one. Its own token
@@ -621,6 +641,9 @@ func (s *server) liveActivity(event string, c contentState, urgent bool) {
 			return nil
 		}
 		err := s.push.send(d.Env, token, "liveactivity", priority, payload(ev))
+		if ev != "update" {
+			log.Printf("live activity %s for %.8s…: %v", ev, d.Token, err)
+		}
 		if ev == "end" || (errors.Is(err, errGone) && token == act) {
 			s.mu.Lock()
 			d.ActivityToken = ""
@@ -669,8 +692,11 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if in.StartToken != "" {
 		d.StartToken = in.StartToken
 	}
-	if in.ActivityToken != "" {
-		d.ActivityToken = in.ActivityToken
+	if in.ActivityToken != "" && in.ActivityToken != d.ActivityToken {
+		d.ActivityToken, d.ActivityStart = in.ActivityToken, time.Now()
+	}
+	if in.NoActivity {
+		d.ActivityToken = "" // the next change starts one
 	}
 	s.saveDevices()
 	s.mu.Unlock()

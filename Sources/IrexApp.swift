@@ -886,6 +886,7 @@ struct ContentView: View {
                 }
             }
             push.loadMutes()
+            push.send()   // a Live Activity may have ended while irex was away
         }
     }
 }

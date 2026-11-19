@@ -1,4 +1,5 @@
 import SwiftUI
+import WidgetKit
 
 // The Live Activity's views, shared by the widget extension and, for rendering checks, the app.
 
@@ -107,5 +108,46 @@ struct ExpandedHeadline: View {
         Text(state.headline).font(.caption.weight(.semibold))
             .foregroundStyle(state.blocked > 0 ? .red : .secondary)
             .padding(.trailing, 6)
+    }
+}
+
+/// The Live Activity in the Apple Watch Smart Stack: the count that matters, and the agent on top.
+struct WatchStack: View {
+    let state: AgentsAttributes.ContentState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Mark()
+                Text(state.headline).font(.caption.weight(.semibold))
+                    .foregroundStyle(state.blocked > 0 ? .red : .primary).lineLimit(1)
+            }
+            if let top = state.items.first {
+                HStack(spacing: 5) {
+                    Circle().fill(activityColor(top.state)).frame(width: 6, height: 6)
+                    Text(top.title).font(.footnote.weight(.semibold)).lineLimit(1)
+                }
+                if !top.detail.isEmpty {
+                    Text(top.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
+            }
+            if state.more + state.items.count > 1 {
+                Text("+\(state.more + state.items.count - 1) more").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The Live Activity's main view: the Lock Screen's, or the Watch's in its Smart Stack.
+struct ActivityMain: View {
+    let state: AgentsAttributes.ContentState
+    @Environment(\.activityFamily) private var family
+
+    var body: some View {
+        switch family {
+        case .small: WatchStack(state: state).padding(8)
+        default: LockScreen(state: state)
+        }
     }
 }

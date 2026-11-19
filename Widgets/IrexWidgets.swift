@@ -15,7 +15,7 @@ struct IrexWidgets: WidgetBundle {
 struct AgentsLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: AgentsAttributes.self) { context in
-            LockScreen(state: context.state)
+            ActivityMain(state: context.state)
                 .activityBackgroundTint(activityNavy)
                 .activitySystemActionForegroundColor(.white)
                 .widgetURL(paneURL(context.state.items.first?.block))
@@ -40,6 +40,7 @@ struct AgentsLiveActivity: Widget {
             .widgetURL(paneURL(context.state.items.first?.block))
             .keylineTint(activityTeal)
         }
+        .supplementalActivityFamilies([.small])   // its own layout in the Apple Watch Smart Stack
     }
 }
 

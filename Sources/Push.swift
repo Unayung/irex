@@ -162,11 +162,12 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
             let state = Self.demoState(kind)
             let sheet = VStack(spacing: 18) {
                 LockScreen(state: state)
-                    .frame(width: 370)
+                    .frame(width: 370, height: 160, alignment: .top)   // what iOS allows; overflow shows as clipping
+                    .clipped()
                     .background(activityNavy, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                 VStack(alignment: .leading, spacing: 10) {
                     HStack { Mark().padding(.leading, 6); Spacer(); ExpandedHeadline(state: state) }
-                    Rows(items: state.items, more: state.more).padding(.horizontal, 6)
+                    Rows(items: Array(state.items.prefix(activityRows))).padding(.horizontal, 6)
                 }
                 .padding(.horizontal, 14).padding(.vertical, 16)
                 .frame(width: 370)

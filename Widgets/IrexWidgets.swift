@@ -28,7 +28,7 @@ struct AgentsLiveActivity: Widget {
                     ExpandedHeadline(state: context.state)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    Rows(items: context.state.items, more: context.state.more).padding(.horizontal, 6)
+                    Rows(items: Array(context.state.items.prefix(activityRows))).padding(.horizontal, 6)
                 }
             } compactLeading: {
                 Mark()

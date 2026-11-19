@@ -5,3 +5,4 @@ Info.plist
 bin/config
 Irex.entitlements
 Widgets.plist
+Widgets.entitlements

@@ -104,8 +104,12 @@ final class TerminalModel {
         onChange?()
     }
 
+    /// The grid's width, for telling where the terminal wrapped a line.
+    private(set) var columns = 80
+
     func resizeGrid(cols: Int, rows: Int) {
         guard (1...65535).contains(cols), (1...65535).contains(rows) else { return }
+        columns = cols
         ghostty_terminal_resize(term, UInt16(cols), UInt16(rows), cellPx.w, cellPx.h)
         onChange?()
     }

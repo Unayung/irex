@@ -31,19 +31,26 @@ struct Mark: View {
     }
 }
 
+/// iOS gives a Lock Screen Live Activity about 160 points of height: room for two agents.
+let activityRows = 2
+
 struct LockScreen: View {
     let state: AgentsAttributes.ContentState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
+        let shown = Array(state.items.prefix(activityRows))
+        let rest = state.more + state.items.count - shown.count
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline) {
                 Mark()
-                Text(state.headline).font(.headline).foregroundStyle(.white)
-                Spacer()
+                Text(state.headline).font(.headline).foregroundStyle(.white).lineLimit(1)
+                Spacer(minLength: 6)
+                // On the headline's line, not one of its own: there's no height to spare.
+                if rest > 0 { Text("+\(rest) more").font(.caption.weight(.medium)).foregroundStyle(.white.opacity(0.5)) }
             }
-            Rows(items: state.items, more: state.more)
+            Rows(items: shown)
         }
-        .padding(14)
+        .padding(.horizontal, 14).padding(.vertical, 12)
     }
 }
 

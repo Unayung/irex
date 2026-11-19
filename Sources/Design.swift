@@ -315,6 +315,7 @@ struct PaneHeader: View {
     let compact: Bool
     let onBack: () -> Void
     let onOverview: () -> Void
+    let onFiles: () -> Void
     let onCompose: () -> Void
     let onAttach: (AttachSource) -> Void
 
@@ -335,11 +336,21 @@ struct PaneHeader: View {
                 }
                 .accessibilityLabel("All panes, \(place.position) of \(place.count)")
             }
+            Menu {
+                // What's on screen, to keep or send: the phone has no easy way to select a whole screen.
+                Button { UIPasteboard.general.string = screenText } label: { Label("Copy Screen Text", systemImage: "doc.on.doc") }
+                Button { sharing = SharedText(text: screenText) } label: { Label("Share Screen Text…", systemImage: "square.and.arrow.up") }
+                Button(action: onFiles) { Label("Files on Screen", systemImage: "doc.viewfinder") }
+                if let place, place.count > 1 {
+                    Button(action: onOverview) { Label("All Panes", systemImage: "rectangle.split.2x2") }
+                }
+            } label: {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     if let pane, !pane.status.isEmpty { StatusGlyph(status: pane.status) }
                     if let pane { AgentIcon(agent: pane.agent) }
                     Text(pane?.title ?? "Pane").font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
                 }
                 if let pane {
                     let tab = place.flatMap { $0.tabCount > 1 ? " · \($0.tab.label)" : nil } ?? ""
@@ -347,6 +358,8 @@ struct PaneHeader: View {
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
+            }
+            .menuStyle(.button).buttonStyle(.plain)   // the title keeps its own colours, not the tint
             Spacer(minLength: 6)
             if !stream.owning {
                 // Another client sizes this pane; take it for this screen.
@@ -377,7 +390,26 @@ struct PaneHeader: View {
         .background(.bar)
         .background(Color(.systemGroupedBackground))   // not the terminal's colour through the material
         .overlay(alignment: .bottom) { Divider() }
+        .sheet(item: $sharing) { ShareSheet(text: $0.text).presentationDetents([.medium, .large]) }
     }
+
+    @State private var sharing: SharedText?
+
+    private var screenText: String { stream.terminal.lastLines(500).joined(separator: "\n") }
+}
+
+struct SharedText: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+/// The system share sheet, for text made at the moment you ask.
+struct ShareSheet: UIViewControllerRepresentable {
+    let text: String
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
 
 // MARK: quick reply
@@ -620,7 +652,7 @@ struct UploadNote: View {
             HStack(spacing: 6) {
                 if stream.uploadFailed {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                } else if note.hasPrefix("Uploading") {
+                } else if note.hasPrefix("Uploading") || note.hasPrefix("Opening") {
                     ProgressView().controlSize(.mini)
                 } else {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)

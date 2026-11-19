@@ -17,6 +17,7 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
     var onPaneSwipe: ((PaneSwipe) -> Void)?
     var onFontSizeChange: ((CGFloat) -> Void)?
     var onCellTap: ((Int, Int) -> Void)?         // column, row of the server's screen
+    var onOpenPath: ((String) -> Void)?          // a file path tapped on screen
     var onPasteImage: ((UIImage) -> Void)?       // pasting an image attaches it instead
     var onScrolledBack: ((Bool) -> Void)?        // whether the view shows scrollback rather than the live screen
     private var scrolledBack = false
@@ -289,6 +290,9 @@ final class TerminalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIEdi
 
     @objc private func tapped(_ g: UITapGestureRecognizer) {
         if selection != nil { selection = nil; setNeedsDisplay(); return }
+        // A file path an agent printed opens it, without bringing up the keyboard.
+        let at = cell(at: g.location(in: self))
+        if let open = onOpenPath, let path = model.path(atColumn: at.x, row: at.y) { open(path); return }
         becomeFirstResponder()
         onActivate?(.userTouch)
         // Only the live screen matches the server's coordinates, so links work at the bottom.

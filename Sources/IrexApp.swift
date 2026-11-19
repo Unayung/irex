@@ -516,6 +516,7 @@ struct ContentView: View {
     @State private var replyTo: AppModel.Pane?
     @State private var composing = false
     @State private var overviewShown = false
+    @State private var screenFiles: [String]?
     @State private var query = ""
     @State private var renaming: AppModel.Session?
     @State private var newName = ""
@@ -644,6 +645,7 @@ struct ContentView: View {
                     PaneHeader(stream: s, pane: app.pane(s.blockId), place: app.place(s.blockId), compact: sizeClass == .compact,
                                onBack: { if sizeClass == .compact { app.closePane() } else { columns = columns == .detailOnly ? .all : .detailOnly } },
                                onOverview: { overviewShown = true },
+                               onFiles: { screenFiles = s.terminal.pathsOnScreen() },
                                onCompose: { composing = true },
                                onAttach: { source in
                                    switch source {
@@ -660,6 +662,7 @@ struct ContentView: View {
                                           onPaneSwipe: { paneSwipe($0) },
                                           onFontSizeChange: { fontSize = $0 },
                                           onCellTap: { col, row in app.clicked(s.blockId); s.click(column: col, row: row) },
+                                          onOpenPath: { path in Task { await s.preview(path) } },
                                           onScrolledBack: { scrolledBack = $0 },
                                           onPasteImage: { image in
                                               if let a = Attachments.screenshot(image, name: "pasted-" + Attachments.stamp(0, of: 1)) {
@@ -726,6 +729,14 @@ struct ContentView: View {
             if let s = app.stream {
                 PaneOverview(app: app, sessionId: s.sessionId) { p, watched in overviewShown = false; Task { await app.open(p, reusing: watched) } }
             }
+        }
+        .sheet(isPresented: Binding(get: { screenFiles != nil }, set: { if !$0 { screenFiles = nil } })) {
+            ScreenFiles(paths: screenFiles ?? []) { path in
+                screenFiles = nil
+                // Quick Look comes up once the list has gone.
+                if let s = app.stream { Task { try? await Task.sleep(for: .milliseconds(450)); await s.preview(path) } }
+            }
+            .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $composing) {
             if let s = app.stream { ComposeView(stream: s, paneTitle: app.pane(s.blockId)?.title).presentationDetents([.medium, .large]) }
@@ -824,6 +835,39 @@ struct ContentView: View {
             if let demo = UserDefaults.standard.string(forKey: "demoActivity") { push.demoActivity(demo) }
             if UserDefaults.standard.bool(forKey: "renderActivity") { push.renderActivity() }
             if UserDefaults.standard.bool(forKey: "renderWidget") { push.renderWidget() }
+            if UserDefaults.standard.bool(forKey: "checkPaths") { FilePaths.selfCheck(); print("paths ok") }
+            if let path = UserDefaults.standard.string(forKey: "previewTest") {
+                try? await Task.sleep(for: .seconds(6))
+                if let s = app.stream { await s.preview(path) }
+            }
+            // `-pathsAt "22,0 45,0 3,0"`: the path at each column,row of the open pane, into Documents/paths.txt.
+            if let cells = UserDefaults.standard.string(forKey: "pathsAt") {
+                try? await Task.sleep(for: .seconds(6))
+                let found = cells.split(separator: " ").map { cell -> String in
+                    let n = cell.split(separator: ",").compactMap { Int($0) }
+                    return "\(cell)=\(n.count == 2 ? app.stream?.terminal.path(atColumn: n[0], row: n[1]) ?? "-" : "?")"
+                }
+                try? found.joined(separator: " ").write(to: URL.documentsDirectory.appending(path: "paths.txt"), atomically: true, encoding: .utf8)
+            }
+            if UserDefaults.standard.bool(forKey: "showFiles") {
+                try? await Task.sleep(for: .seconds(6))
+                screenFiles = app.stream?.terminal.pathsOnScreen()
+            }
+            // `-downloadTest <path>` with `-openPane <title>`: downloads it from that pane, result in Documents/download.txt.
+            if let path = UserDefaults.standard.string(forKey: "downloadTest") {
+                try? await Task.sleep(for: .seconds(6))
+                var note = "no pane open"
+                if let s = app.stream {
+                    do {
+                        let url = try await s.download(path)
+                        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? -1
+                        note = "ok \(url.lastPathComponent) \(size) bytes"
+                        let again = try await s.download(path)
+                        note += "; again \(again == url ? "same file" : "different")"
+                    } catch { note = "failed: \(describe(error))" }
+                }
+                try? note.write(to: URL.documentsDirectory.appending(path: "download.txt"), atomically: true, encoding: .utf8)
+            }
             // `-attachTest YES` with `-openPane <title>`: attaches a generated image to that pane.
             if UserDefaults.standard.bool(forKey: "attachTest") {
                 try? await Task.sleep(for: .seconds(6))
@@ -1043,7 +1087,7 @@ extension ContentView {
             swipeArmed = false
             if app.neighbor(delta) != nil && (abs(dx) > Self.swipeThreshold || flick) {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                let width = UIScreen.main.bounds.width
+                let width = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.width ?? 430
                 withAnimation(.easeIn(duration: 0.15)) { swipeDX = dx < 0 ? -width : width }
                 Task { try? await Task.sleep(for: .milliseconds(150)); app.openNeighbor(delta) }
             } else {
@@ -1066,6 +1110,7 @@ struct TerminalRepresentable: UIViewRepresentable {
     let onPaneSwipe: (TerminalView.PaneSwipe) -> Void
     let onFontSizeChange: (Double) -> Void
     let onCellTap: (Int, Int) -> Void
+    let onOpenPath: (String) -> Void
     let onScrolledBack: (Bool) -> Void
     let onPasteImage: (UIImage) -> Void
 
@@ -1081,6 +1126,7 @@ struct TerminalRepresentable: UIViewRepresentable {
         v.onPaneSwipe = onPaneSwipe
         v.onFontSizeChange = { onFontSizeChange(Double($0)) }
         v.onCellTap = onCellTap
+        v.onOpenPath = onOpenPath
         v.onPasteImage = onPasteImage
         v.onScrolledBack = onScrolledBack
         Task {

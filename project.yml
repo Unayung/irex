@@ -2,7 +2,7 @@ name: Irex
 options:
   bundleIdPrefix: io.github.unayung
   deploymentTarget:
-    iOS: "18.0"   # the Live Activity's Apple Watch layout
+    iOS: "26.0"   # widgets reloaded by push
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -35,7 +35,6 @@ targets:
         NSCameraUsageDescription: Take a photo to attach to a pane, for the agent in it to see.
         CFBundleURLTypes: [{CFBundleURLName: io.github.unayung.Irex, CFBundleURLSchemes: [irex]}]
         UILaunchScreen: {}
-        UIRequiresFullScreen: false
         UISupportedInterfaceOrientations~iphone: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
   IrexWidgets:
@@ -43,6 +42,10 @@ targets:
     type: app-extension
     platform: iOS
     sources: [Widgets, Shared]
+    entitlements:
+      path: Widgets.entitlements
+      properties:
+        aps-environment: development   # WidgetKit pushes (iOS 26)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.unayung.Irex.Widgets

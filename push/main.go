@@ -114,7 +114,7 @@ func (a *apns) token() (string, error) {
 
 var errGone = errors.New("token no longer valid")
 
-// send posts one push. kind is "alert" or "liveactivity".
+// send posts one push. kind is "alert", "liveactivity", or "widgets".
 func (a *apns) send(env, deviceToken, kind string, priority int, payload any) error {
 	if a.key == nil {
 		return errors.New("no APNs key yet")
@@ -130,8 +130,8 @@ func (a *apns) send(env, deviceToken, kind string, priority int, payload any) er
 		return err
 	}
 	topic := a.cfg.topic
-	if kind == "liveactivity" {
-		topic += ".push-type.liveactivity"
+	if kind == "liveactivity" || kind == "widgets" {
+		topic += ".push-type." + kind
 	}
 	req.Header.Set("authorization", "bearer "+jwt)
 	req.Header.Set("apns-topic", topic)
@@ -209,6 +209,86 @@ type server struct {
 	shown      contentState
 	lastActive time.Time
 	dirty      chan struct{}
+	// The widgets: push token → sandbox or production, and what they were last told about.
+	widgets     map[string]string
+	widgetShown string
+	widgetAt    time.Time
+}
+
+func (s *server) widgetsFile() string { return filepath.Join(s.cfg.state, "widgets.json") }
+
+func (s *server) loadWidgets() {
+	s.widgets = map[string]string{}
+	if raw, err := os.ReadFile(s.widgetsFile()); err == nil {
+		_ = json.Unmarshal(raw, &s.widgets)
+	}
+}
+
+// saveWidgets writes the widget tokens; call with s.mu held.
+func (s *server) saveWidgets() {
+	raw, _ := json.Marshal(s.widgets)
+	_ = os.MkdirAll(s.cfg.state, 0o700)
+	_ = os.WriteFile(s.widgetsFile(), raw, 0o600)
+}
+
+// widgetKey is what the widgets show that's worth a push: the counts and who's on top,
+// not every line an agent writes about what it's doing.
+func widgetKey(c contentState) string {
+	k := fmt.Sprintf("%d/%d/%d", c.Working, c.Blocked, c.Done)
+	for _, it := range c.Items {
+		k += "|" + it.State + ":" + it.Title
+	}
+	return k
+}
+
+// refreshWidgets asks the widgets to reload when what they show has changed, at most once a
+// minute: the system budgets these pushes, and the next tick catches anything held back.
+func (s *server) refreshWidgets(c contentState) {
+	key := widgetKey(c)
+	if key == s.widgetShown || time.Since(s.widgetAt) < time.Minute {
+		return
+	}
+	s.widgetShown, s.widgetAt = key, time.Now()
+	s.mu.Lock()
+	list := make(map[string]string, len(s.widgets))
+	for t, env := range s.widgets {
+		list[t] = env
+	}
+	s.mu.Unlock()
+	for token, env := range list {
+		err := s.push.send(env, token, "widgets", 5, map[string]any{"aps": map[string]any{"content-changed": true}})
+		if errors.Is(err, errGone) {
+			s.mu.Lock()
+			delete(s.widgets, token)
+			s.saveWidgets()
+			s.mu.Unlock()
+		} else if err != nil {
+			log.Printf("widget push to %.8s…: %v", token, err)
+		}
+	}
+}
+
+// widget takes a widget's push token (POST {"token", "env"}), sent by the widget extension itself.
+func (s *server) widget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var in struct {
+		Token string `json:"token"`
+		Env   string `json:"env"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&in); err != nil || !hexToken(in.Token) ||
+		(in.Env != "sandbox" && in.Env != "production") {
+		http.Error(w, "bad widget token", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.widgets[in.Token] = in.Env
+	s.saveWidgets()
+	s.mu.Unlock()
+	log.Printf("widget %.8s… (%s)", in.Token, in.Env)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) devicesFile() string { return filepath.Join(s.cfg.state, "devices.json") }
@@ -566,6 +646,7 @@ func (s *server) activities() {
 			<-s.dirty
 		}
 		c := s.summary()
+		s.refreshWidgets(c)
 		busy := c.Working+c.Blocked > 0
 		if busy {
 			s.lastActive = time.Now()
@@ -779,6 +860,7 @@ func main() {
 	}
 	s := &server{cfg: cfg, push: push, panes: map[string]*pane{}, dirty: make(chan struct{}, 1)}
 	s.loadDevices()
+	s.loadWidgets()
 	s.loadMuted()
 
 	var hosts struct {
@@ -797,6 +879,7 @@ func main() {
 	http.HandleFunc("/test", s.test)
 	http.HandleFunc("/mutes", s.mutes)
 	http.HandleFunc("/summary", s.summaryHandler)
+	http.HandleFunc("/widget", s.widget)
 	log.Printf("listening on %s for %d device(s), watching %d host(s)", cfg.listen, len(s.devices), 1+len(hosts.Hosts))
 	log.Fatal(http.ListenAndServe(cfg.listen, nil))
 }

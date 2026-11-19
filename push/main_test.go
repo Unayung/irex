@@ -129,3 +129,35 @@ func TestRegisterKeepsActivityAge(t *testing.T) {
 		t.Fatal("an ended activity kept its token")
 	}
 }
+
+func TestWidgetKeyIgnoresChatter(t *testing.T) {
+	a := contentState{Working: 1, Items: []item{{Title: "builder", State: "working", Detail: "reading a.go"}}}
+	b := a
+	b.Items = []item{{Title: "builder", State: "working", Detail: "reading b.go"}}
+	if widgetKey(a) != widgetKey(b) {
+		t.Fatal("a new line of activity shouldn't push the widgets")
+	}
+	b.Items = []item{{Title: "builder", State: "blocked"}}
+	if widgetKey(a) == widgetKey(b) {
+		t.Fatal("an agent that now needs you should")
+	}
+}
+
+func TestWidgetTokenStored(t *testing.T) {
+	s := &server{cfg: config{state: t.TempDir()}, widgets: map[string]string{}}
+	token := strings.Repeat("ef", 32)
+	rec := httptest.NewRecorder()
+	s.widget(rec, httptest.NewRequest("POST", "/widget", strings.NewReader(`{"token":"`+token+`","env":"sandbox"}`)))
+	if rec.Code != 204 || s.widgets[token] != "sandbox" {
+		t.Fatalf("widget: %d %v", rec.Code, s.widgets)
+	}
+	s.loadWidgets()
+	if s.widgets[token] != "sandbox" {
+		t.Fatal("not saved")
+	}
+	bad := httptest.NewRecorder()
+	s.widget(bad, httptest.NewRequest("POST", "/widget", strings.NewReader(`{"token":"zz","env":"sandbox"}`)))
+	if bad.Code != 400 {
+		t.Fatalf("bad token answered %d", bad.Code)
+	}
+}

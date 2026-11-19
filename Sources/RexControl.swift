@@ -62,7 +62,7 @@ final class RexControl {
         task = t
         t.resume()
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
-        try await send(["type": "hello", "api_revision": 11,
+        try await send(["type": "hello", "api_revision": 13,   // 13: download_begin
                         "client": ["kind": "app", "platform": "ios", "name": "irex", "version": version]])
         receiveLoop(t)
         try await withCheckedThrowingContinuation { welcome = $0 }

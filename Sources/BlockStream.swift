@@ -1,3 +1,4 @@
+import CryptoKit
 import UIKit
 
 /// What just happened that might justify taking ownership of a block.
@@ -141,6 +142,9 @@ final class BlockStream: ObservableObject {
         if enter { send(terminal.enterKey) }
     }
 
+    /// The note over the terminal, for files coming the other way too.
+    func noteFile(_ note: String?, failed: Bool) { uploadNote = note; uploadFailed = failed }
+
     /// A file to hand to the pane's program: Rex puts it on the pane's machine and types its path.
     struct Attachment { let name: String; let data: Data }
 
@@ -190,6 +194,51 @@ final class BlockStream: ObservableObject {
         // Read until the server closes; how it closes says whether the file arrived.
         while (try? await t.receive()) != nil {}
         guard t.closeCode == .normalClosure else { throw RexError(description: "it didn't finish (\(t.closeCode.rawValue))") }
+    }
+
+    /// A file from the pane's machine, kept in Caches; `path` may be relative to where the pane's
+    /// program runs, as agents print them. An unchanged file isn't fetched again.
+    func download(_ path: String) async throws -> URL {
+        let key = "\(blockId)|\(path)"
+        // One folder per pane and path, so two files with the same name don't overwrite each other.
+        let folder = SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let dir = URL.cachesDirectory.appending(path: "downloads/\(folder)")
+        let file = dir.appending(path: (path as NSString).lastPathComponent)
+        var args: [String: Any] = ["ref": "download:" + UUID().uuidString.lowercased(), "path": path]
+        let known = UserDefaults.standard.dictionary(forKey: "downloadVersions") as? [String: String] ?? [:]
+        if let v = known[key], FileManager.default.fileExists(atPath: file.path) { args["if_none_match"] = v }
+        let r = try await control.call("com.superlogical.terminal.download_begin", ["session_id": sessionId, "block_id": blockId, "args": args])
+        if r["not_modified"] as? Bool == true { return file }
+        let version = r["version"] as? String
+        guard let ticket = (r["ticket"] as? String).flatMap(Self.base64url), ticket.count == 16 else {
+            throw RexError(description: "no download ticket")
+        }
+        let ep = control.endpoint
+        let t = session.webSocketTask(with: ep.socketURL("/api/data"), protocols: ep.protocols("rex.data.bytes.v1"))
+        t.maximumMessageSize = 1 << 20
+        t.resume()
+        defer { t.cancel(with: .normalClosure, reason: nil) }
+        try await t.send(.data(Data([0x01]) + ticket))
+        guard case .data(let welcome) = try await t.receive(), welcome.first == 0x81 else {
+            throw RexError(description: "the server refused it")
+        }
+        // ponytail: the whole file in memory; agents' screenshots and notes are small. Stream to disk if that changes.
+        var bytes = Data()
+        while true {
+            guard let m = try? await t.receive() else {
+                guard t.closeCode == .normalClosure else { throw RexError(description: "it stopped partway (\(t.closeCode.rawValue))") }
+                break
+            }
+            guard case .data(let d) = m else { continue }
+            if d.isEmpty { break }   // the end, if the server marks it as uploads are marked
+            bytes.append(d)
+        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try bytes.write(to: file, options: .atomic)
+        var versions = known
+        versions[key] = version   // nil when the server can't vouch for it: not cached
+        UserDefaults.standard.set(versions, forKey: "downloadVersions")
+        return file
     }
 
     /// A left click at a cell of the server's screen. A link (OSC 8) there comes back as a

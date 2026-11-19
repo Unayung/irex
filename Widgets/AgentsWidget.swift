@@ -14,6 +14,27 @@ struct AgentsWidget: Widget {
         .description("Who needs you, and who's working, across your Rex hosts.")
         // ponytail: no large size; irex-push sends three agents, which medium nearly shows already.
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular, .accessoryCircular, .accessoryInline])
+        // Reloaded by irex-push when what it shows changes, not only every 15 minutes.
+        .pushHandler(AgentsPushHandler.self)
+    }
+}
+
+/// Hands the widget's push token to irex-push, which sends `content-changed` when the counts move.
+struct AgentsPushHandler: WidgetPushHandler {
+    func pushTokenDidChange(_ pushInfo: WidgetPushInfo, widgets: [WidgetInfo]) {
+        guard let address = Bundle.main.object(forInfoDictionaryKey: "IrexRelay") as? String,
+              let relay = URL(string: address) else { return }
+        #if DEBUG
+        let env = "sandbox"
+        #else
+        let env = "production"
+        #endif
+        var req = URLRequest(url: relay.appending(path: "widget"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let token = pushInfo.token.map { String(format: "%02x", $0) }.joined()
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["token": token, "env": env])
+        URLSession.shared.dataTask(with: req).resume()
     }
 }
 

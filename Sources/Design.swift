@@ -375,6 +375,7 @@ struct PaneHeader: View {
         }
         .padding(.horizontal, 8).padding(.vertical, 4)
         .background(.bar)
+        .background(Color(.systemGroupedBackground))   // not the terminal's colour through the material
         .overlay(alignment: .bottom) { Divider() }
     }
 }
@@ -906,4 +907,10 @@ struct AnswerBar: View {
         .buttonStyle(.plain)
         .accessibilityLabel(key.map { "\($0), \(label)" } ?? label)
     }
+}
+
+/// Behind the terminal: its own background, out to the screen's edges.
+struct StreamBackdrop: View {
+    @ObservedObject var stream: BlockStream
+    var body: some View { Color(uiColor: stream.background).ignoresSafeArea(edges: [.horizontal, .bottom]) }
 }

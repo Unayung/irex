@@ -39,7 +39,7 @@ targets:
         UISupportedInterfaceOrientations~iphone: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
   IrexWidgets:
-    # The Live Activity on the lock screen and in the Dynamic Island.
+    # The Live Activity on the lock screen and in the Dynamic Island, and the Agents widget.
     type: app-extension
     platform: iOS
     sources: [Widgets, Shared]
@@ -50,5 +50,8 @@ targets:
       path: Widgets.plist
       properties:
         CFBundleDisplayName: irex
+        # irex-push, for the Agents widget: RELAY in bin/config. (An App Group would let the app tell it,
+        # but automatic signing with an API key can't register one.)
+        IrexRelay: $(IREX_RELAY)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension

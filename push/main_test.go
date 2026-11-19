@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"math/big"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -71,5 +73,22 @@ func TestMutedPanesStayOut(t *testing.T) {
 func TestHexToken(t *testing.T) {
 	if !hexToken(strings.Repeat("ab", 32)) || hexToken("xyz") || hexToken(strings.Repeat("g", 64)) {
 		t.Fatal("hexToken")
+	}
+}
+
+func TestSummaryEndpoint(t *testing.T) {
+	s := &server{muted: map[string]bool{}, panes: map[string]*pane{
+		"block:a": {block: "block:a", title: "builder", state: "blocked", changed: time.Now()},
+	}}
+	rec := httptest.NewRecorder()
+	s.summaryHandler(rec, httptest.NewRequest("GET", "/summary", nil))
+	var c contentState
+	if err := json.NewDecoder(rec.Body).Decode(&c); err != nil || c.Blocked != 1 || len(c.Items) != 1 || c.Items[0].Title != "builder" {
+		t.Fatalf("summary: %v %+v", err, c)
+	}
+	post := httptest.NewRecorder()
+	s.summaryHandler(post, httptest.NewRequest("POST", "/summary", nil))
+	if post.Code != 405 {
+		t.Fatalf("POST answered %d", post.Code)
 	}
 }

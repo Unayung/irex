@@ -1,5 +1,6 @@
 import ActivityKit
 import SwiftUI
+import WidgetKit
 import UIKit
 import UserNotifications
 
@@ -179,6 +180,27 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// `-renderWidget YES` draws the Agents widget at each size into Documents/widget-*.png.
+    func renderWidget() {
+        let busy = AgentsEntry(date: .now, state: Self.demoState("busy"))
+        let quiet = AgentsEntry(date: .now, state: Self.demoState("done"), stale: true)
+        func tile(_ e: AgentsEntry, _ f: WidgetFamily, _ w: CGFloat, _ h: CGFloat) -> some View {
+            AgentsWidgetView(entry: e, size: f).padding(f == .accessoryCircular || f == .accessoryRectangular ? 0 : 16)
+                .frame(width: w, height: h)
+                .background(f == .accessoryCircular || f == .accessoryRectangular ? Color.black.opacity(0.4) : activityNavy,
+                            in: RoundedRectangle(cornerRadius: f == .accessoryCircular ? w / 2 : 22, style: .continuous))
+        }
+        let sheet = VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 16) { tile(busy, .systemSmall, 170, 170); tile(quiet, .systemSmall, 170, 170) }
+            tile(busy, .systemMedium, 364, 170)
+            HStack(spacing: 16) { tile(busy, .accessoryRectangular, 172, 76); tile(busy, .accessoryCircular, 76, 76) }
+        }
+        .padding(24).background(Color(white: 0.35)).environment(\.colorScheme, .dark)
+        let renderer = ImageRenderer(content: sheet)
+        renderer.scale = 2
+        try? renderer.uiImage?.pngData()?.write(to: URL.documentsDirectory.appending(path: "widget.png"))
+    }
+
     /// `-demoActivity busy|working|done` starts a Live Activity with sample agents, to look at it in the simulator.
     func demoActivity(_ kind: String) {
         let state = Self.demoState(kind)
@@ -251,3 +273,4 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 extension Data {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
 }
+

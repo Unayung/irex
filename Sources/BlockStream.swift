@@ -1,4 +1,4 @@
-import Foundation
+import UIKit
 
 /// What just happened that might justify taking ownership of a block.
 /// Owning a block makes the server size the pty (and pick colors) for *this* client,
@@ -21,6 +21,8 @@ final class BlockStream: ObservableObject {
     /// Why the stream stopped by itself, if it did; `exited` when the program in the pane ended.
     @Published private(set) var ended: String?
     @Published private(set) var exited = false
+    /// The pane's theme background, to fill the screen's edges beside the grid.
+    @Published private(set) var background = UIColor.black
     /// Whether irex sizes this pane. Until it does, the pane keeps the owner's size and irex
     /// shows it scaled down, so watching from a phone doesn't reflow it on the Mac.
     @Published private(set) var owning = false
@@ -48,6 +50,7 @@ final class BlockStream: ObservableObject {
 
     init(control: RexControl, sessionId: String, blockId: String, terminal: TerminalModel) {
         self.control = control; self.sessionId = sessionId; self.blockId = blockId; self.terminal = terminal
+        background = terminal.background
     }
 
     func start() async {
@@ -286,6 +289,7 @@ final class BlockStream: ObservableObject {
             }
         case "theme":
             terminal.setTheme(m)
+            background = terminal.background
         case "child_exited":
             exited = true
             end(m["exit_code"].map { "exit code \($0)" } ?? "")

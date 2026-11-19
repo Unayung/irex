@@ -4,7 +4,10 @@ import WidgetKit
 
 @main
 struct IrexWidgets: WidgetBundle {
-    var body: some Widget { AgentsLiveActivity() }
+    var body: some Widget {
+        AgentsLiveActivity()
+        AgentsWidget()
+    }
 }
 
 /// On the lock screen and in the Dynamic Island: what every agent is up to, the ones

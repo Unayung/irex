@@ -688,6 +688,16 @@ func hexToken(t string) bool {
 }
 
 // mutes lists the muted IDs (GET) or mutes or unmutes one (POST {"id", "muted"}).
+// summaryHandler answers what the Live Activity shows, for the app's widgets, which can't hold a socket.
+func (s *server) summaryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.summary())
+}
+
 func (s *server) mutes(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var in struct {
@@ -760,6 +770,7 @@ func main() {
 	http.HandleFunc("/register", s.register)
 	http.HandleFunc("/test", s.test)
 	http.HandleFunc("/mutes", s.mutes)
+	http.HandleFunc("/summary", s.summaryHandler)
 	log.Printf("listening on %s for %d device(s), watching %d host(s)", cfg.listen, len(s.devices), 1+len(hosts.Hosts))
 	log.Fatal(http.ListenAndServe(cfg.listen, nil))
 }

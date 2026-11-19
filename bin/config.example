@@ -8,3 +8,4 @@ IPHONE=00008140-000000000000000E
 ASC_KEY_ID=ABC123DEFG
 ASC_ISSUER_ID=00000000-0000-0000-0000-000000000000
 ASC_KEY_PATH=/Users/you/.appstoreconnect/private_keys/AuthKey_ABC123DEFG.p8
+RELAY=https://host.tailnet.ts.net:7298   # irex-push, for the Agents widget (optional)

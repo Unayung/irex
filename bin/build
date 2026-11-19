@@ -7,4 +7,4 @@ AUTH=${ASC_KEY_ID:+-authenticationKeyPath $ASC_KEY_PATH -authenticationKeyID $AS
 rsync -a --delete --exclude .git --exclude vendor --exclude build --exclude '*.xcodeproj' --exclude Info.plist --exclude bin/config "$(dirname "$0")/../" "$MAC:$DEST/"
 ssh -o BatchMode=yes "$MAC" "export PATH=/opt/homebrew/bin:\$PATH; cd $DEST && mkdir -p vendor && rsync -a ~/build/ghostty/zig-out/lib/ghostty-vt.xcframework vendor/ && xcodegen -q && \
   if [ \"${1:-device}\" = sim ]; then xcodebuild -scheme Irex -destination 'generic/platform=iOS Simulator' -derivedDataPath build -quiet build; \
-  else xcodebuild -scheme Irex -destination 'generic/platform=iOS' -derivedDataPath build -allowProvisioningUpdates $AUTH DEVELOPMENT_TEAM=$TEAM -quiet build; fi" 2>&1 | grep -v 'Install \(Started\|Failed\)'
+  else xcodebuild -scheme Irex -destination 'generic/platform=iOS' -derivedDataPath build -allowProvisioningUpdates $AUTH DEVELOPMENT_TEAM=$TEAM IREX_RELAY=$RELAY -quiet build; fi" 2>&1 | grep -v 'Install \(Started\|Failed\)'

@@ -1,5 +1,6 @@
 import PhotosUI
 import SwiftUI
+import WidgetKit
 
 @main
 struct IrexApp: App {
@@ -192,7 +193,9 @@ final class AppModel: ObservableObject {
     private func hostClosed(_ key: String, _ reason: String) {
         controls[key] = nil
         // Stay on the pane: it opens again once the host is back (a phone drops sockets in the background).
-        let keep = stream.flatMap { sessionHost[$0.sessionId] == key ? $0.blockId : nil }
+        // By the pane, not its stream: one still opening has none yet (a widget tap lands just before
+        // iOS reports the sockets it dropped in the background).
+        let keep = openPaneId.flatMap { id in pane(id).flatMap { sessionHost[$0.sessionId] == key ? id : nil } }
         if let keep { stream?.stop(); stream = nil; openWhenListed(keep) }
         if key == "local" {
             // Without the first server there's no host list either; the next connect starts over,
@@ -366,7 +369,8 @@ final class AppModel: ObservableObject {
             status = ""
         } catch {
             status = describe(error)
-            if openPaneId == p.id { openPaneId = nil }   // no pane screen without a pane, nor a way back from it
+            // No pane screen without a pane, nor a way back from it; unless it's waiting to open again.
+            if openPaneId == p.id && wanted?.block != p.id { openPaneId = nil }
         }
     }
 
@@ -504,6 +508,8 @@ struct ContentView: View {
     @AppStorage("keepAwake") private var keepAwake = true
     @Environment(\.scenePhase) private var phase
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.verticalSizeClass) private var verticalSize
+    @State private var keyboardUp = false
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var compactColumn = NavigationSplitViewColumn.sidebar   // iPhone: the list, or the pane
     @State private var settingsShown = false
@@ -580,6 +586,8 @@ struct ContentView: View {
                 }
                 .opacity(app.connected ? 1 : 0.6)
                 .padding(.horizontal, 14).padding(.vertical, 8)
+                .frame(maxWidth: 720)              // a phone on its side: rows stay a readable length
+                .frame(maxWidth: .infinity)
                 .animation(.default, value: app.sessions.flatMap(\.tabs).flatMap(\.panes).map(\.status))
             }
             .background(Color(.systemGroupedBackground))
@@ -631,6 +639,8 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let s = app.stream {
+                    // Sideways with the keyboard up, the terminal needs every row; the key bar can put the keyboard away.
+                    if !(verticalSize == .compact && keyboardUp) {
                     PaneHeader(stream: s, pane: app.pane(s.blockId), place: app.place(s.blockId), compact: sizeClass == .compact,
                                onBack: { if sizeClass == .compact { app.closePane() } else { columns = columns == .detailOnly ? .all : .detailOnly } },
                                onOverview: { overviewShown = true },
@@ -642,7 +652,8 @@ struct ContentView: View {
                                    case .files: filesShown = true
                                    }
                                })
-                    TerminalRepresentable(stream: s, fontSize: fontSize, focusOnOpen: sizeClass != .compact,
+                    }
+                    TerminalRepresentable(stream: s, fontSize: fontSize, focusOnOpen: sizeClass != .compact || UserDefaults.standard.bool(forKey: "focusTerminal"),
                                           onEdgeSwipe: { if sizeClass == .compact { app.closePane() } else { columns = .all } },
                                           onEdgeHover: { _ in },
                                           onCompose: { composing = true },
@@ -657,7 +668,7 @@ struct ContentView: View {
                                           })
                         .id(s.blockId)
                         .offset(x: swipeDX)
-                        .background(Color(.systemGroupedBackground))
+                        .background { if swipeDX != 0 { Color(.systemGroupedBackground) } }   // behind the swipe card
                         .overlay(alignment: swipeDX < 0 ? .trailing : .leading) {
                             if swipeDX != 0 {
                                 let target = app.neighbor(swipeDX < 0 ? 1 : -1)
@@ -700,8 +711,11 @@ struct ContentView: View {
                 }
                 if !app.status.isEmpty && app.connected {   // disconnected, the list says why
                     Text(app.status).font(.footnote).foregroundStyle(.secondary).padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.bar).background(Color(.systemGroupedBackground))
                 }
             }
+            // Out to the screen's edges beside the terminal, in its own colour, not the list's.
+            .background { if let s = app.stream { StreamBackdrop(stream: s) } }
             .toolbar(.hidden, for: .navigationBar)
         }
         .sheet(item: $replyTo) { p in
@@ -780,6 +794,11 @@ struct ContentView: View {
             #if DEBUG
             // `-openBlock <ID>` at launch takes the path a tapped notification takes, before connecting.
             if let id = UserDefaults.standard.string(forKey: "openBlock") { push.pendingBlock = id }
+            // `-landscape YES` turns the simulator sideways, which simctl can't.
+            if UserDefaults.standard.bool(forKey: "landscape"),
+               let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
+            }
             #endif
             if server.isEmpty { welcome = true; return }
             #if DEBUG
@@ -804,6 +823,7 @@ struct ContentView: View {
             if let q = UserDefaults.standard.string(forKey: "query") { query = q }   // `-query <text>`
             if let demo = UserDefaults.standard.string(forKey: "demoActivity") { push.demoActivity(demo) }
             if UserDefaults.standard.bool(forKey: "renderActivity") { push.renderActivity() }
+            if UserDefaults.standard.bool(forKey: "renderWidget") { push.renderWidget() }
             // `-attachTest YES` with `-openPane <title>`: attaches a generated image to that pane.
             if UserDefaults.standard.bool(forKey: "attachTest") {
                 try? await Task.sleep(for: .seconds(6))
@@ -826,6 +846,11 @@ struct ContentView: View {
             #endif
         }
         .onChange(of: server) { _, s in if !s.isEmpty { push.start(server: s) } }
+        // The widgets show the same counts; have them ask again when these change.
+        .onChange(of: app.summary) { _, _ in WidgetCenter.shared.reloadAllTimelines() }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
+        .animation(.snappy, value: keyboardUp)
         // A notification or the Live Activity asked for a pane: open it once the list has it.
         .onOpenURL { push.open($0) }
         .onChange(of: push.pendingBlock, initial: true) { _, id in

@@ -38,6 +38,9 @@ final class TerminalModel {
     private var builtinFg = GhosttyColorRgb(r: 255, g: 255, b: 255)
     private var builtinBg = GhosttyColorRgb(r: 0, g: 0, b: 0)
 
+    /// The theme's background, for what's around the grid.
+    private(set) var background = UIColor.black
+
     init() {
         ghostty_terminal_new(nil, &term, 80, 24)
         ghostty_render_state_new(nil, &render)
@@ -51,6 +54,7 @@ final class TerminalModel {
         var c = GhosttyRenderStateColors(); c.size = MemoryLayout<GhosttyRenderStateColors>.size
         if ghostty_render_state_get(render, GHOSTTY_RENDER_STATE_DATA_COLORS, &c) == GHOSTTY_SUCCESS {
             builtinFg = c.foreground; builtinBg = c.background
+            background = c.background.ui
         }
     }
 
@@ -121,6 +125,7 @@ final class TerminalModel {
         var fg = parse("foreground") ?? builtinFg, bg = parse("background") ?? builtinBg
         ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg)
         ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg)
+        background = bg.ui
         if var cur = parse("cursor") { ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cur) }
         else { ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, nil) }
         var palette = [GhosttyColorRgb](repeating: GhosttyColorRgb(), count: 256)

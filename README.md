@@ -25,7 +25,9 @@ other hosts in its `rex hosts`. A pane's dot pulses while an agent works in it
 and turns green when it's done; the line under the title counts them. When an
 agent is waiting on you, its pane gets a Reply button: it shows the end of the
 question with 1, 2, 3, Esc, and Enter, so you can answer without opening the
-pane. + starts a new session with a shell.
+pane. + starts a new session with a shell, on the host and with the name you
+pick. A session's ··· menu renames or closes it; long-press a pane to mute or
+close it.
 
 Tap a pane to open it, and the button in its corner (or a swipe from the left
 edge) to go back. Swipe sideways to go to the session's next or previous pane.
@@ -35,6 +37,17 @@ message, with dictation, sent as one paste. The paperclip attaches photos, a
 picture from the camera, or files: Rex puts them on the pane's machine and types
 their paths, so an agent can read them. Pasting an image does the same.
 
+The small map left of a pane's title shows where it sits in its tab's split.
+Tap it to see every tab of the session drawn as its split, each pane with its
+latest output, and pick one. Swipes go through the panes in that order, and the
+card that follows a swipe says when it crosses into another tab. Tap the title
+to copy or share the screen's text, or to list the files it mentions.
+
+Tap a file path an agent printed, such as `docs/report.md` (a relative path is
+relative to where the agent runs), and irex fetches it from the pane's machine
+and shows it in Quick Look, ready to share or save. When the agent in the pane
+waits on you, its choices sit as buttons along the bottom.
+
 Pull the list down to search panes and sessions. Idle panes fold away in a
 session that has a few, and panes running a coding agent show its mark.
 
@@ -43,7 +56,9 @@ lacks: esc, ctrl (it applies to the next key), tab, shift-tab, the arrows (hold
 to repeat), and a few symbols. A hardware keyboard works as it does in any
 terminal, and ⌘ adds irex's own keys: ⌘[ and ⌘] for the previous and next
 pane, ⌘F to search, ⌘N for a new session, ⌘↩ to write a message, ⌘W to close
-the pane. When you scroll back, a button takes you to the latest output.
+the pane, ⌘\\ for every pane. When you scroll back, a button takes you to the
+latest output. With the phone on its side and the keyboard up, the title bar
+steps aside to leave the terminal more rows.
 
 When irex opens a pane, it becomes the pane's owner, so the pane takes the size
 of the screen, and other clients see it at that size until one of them takes it
@@ -51,8 +66,8 @@ back; then Fit takes it again. Turn off "Fit panes to this screen" to watch
 panes at their own size instead, until you type. Replying from the list never
 resizes a pane.
 
-Settings hold the server, the hosts, text size, fitting, and keeping the screen
-on while a pane is open.
+Settings hold the server, the hosts, what's muted, text size, fitting, and
+keeping the screen on while a pane is open.
 
 ## Notifications and the Live Activity
 
@@ -62,6 +77,14 @@ gets a notification; while any are working, a Live Activity on the lock screen
 and in the Dynamic Island shows how many, the ones that need you first. Tap
 either to open the pane, or answer a "needs you" notification with its 1, 2,
 or 3 buttons without opening irex (a locked phone asks for Face ID first). irex finds irex-push on port 7298 of the server's host.
+On an Apple Watch, the Live Activity shows in the Smart Stack.
+
+The Agents widget, on the Home Screen or the Lock Screen, shows the same counts
+and the agents on top; irex-push asks it to reload when they change. It finds
+irex-push through `RELAY` in `bin/config`, set when irex is built.
+
+A muted session or pane stays out of notifications and the Live Activity. orex
+shares the list, through irex-push.
 
 It needs an APNs key (developer.apple.com → Keys → Apple Push Notifications
 service), Go, and a way to reach it from the phone, such as Tailscale Serve:
@@ -77,7 +100,7 @@ Settings → Notifications in irex shows whether it's registered and sends a tes
 
 ## Build
 
-irex builds on a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
+irex runs on iOS 26 and later. It builds on a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 and libghostty-vt as an xcframework. Build that from a
 [Ghostty](https://github.com/ghostty-org/ghostty) checkout in `~/build/ghostty` on
 the Mac:
@@ -101,7 +124,8 @@ listed in `rex hosts`.
 
 ## Not yet
 
-Split layouts (a pane opens on its own), answering from a notification, and file upload.
+Complications on the watch face (the Live Activity in the Smart Stack stands in),
+and images pasted into a Claude Code session, which it doesn't keep as files.
 
 ## Agent icons
 

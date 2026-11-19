@@ -671,6 +671,8 @@ struct ContentView: View {
                         .clipped()
                         .overlay(alignment: .top) { UploadNote(stream: s) }
                         .overlay { StreamEnded(stream: s, onReconnect: { app.reopen() }, onClose: { app.closePane() }) }
+                        .overlay(alignment: .bottom) { AnswerBar(stream: s, pane: app.pane(s.blockId)) }
+                        .animation(.snappy, value: app.pane(s.blockId)?.status)
                         .overlay(alignment: .bottomTrailing) {
                             if scrolledBack {
                                 // Back to what the program is doing now.
@@ -785,7 +787,7 @@ struct ContentView: View {
             #else
             let review = false
             #endif
-            if !review { push.start(server: server) }
+            if !review { push.start(server: server) } else { push.useRelay(server: server); push.loadMutes() }
             await app.connect(server)
             #if DEBUG
             // Screens for simulator review: `-showSettings YES`, `-showReply <pane title>`.
@@ -870,7 +872,18 @@ struct SettingsView: View {
     @Binding var fontSize: Double
     @Binding var keepAwake: Bool
     @AppStorage("fitOnOpen") private var fitOnOpen = true
+    @ObservedObject private var push = Push.shared
     @Environment(\.dismiss) private var dismiss
+
+    private func mutedName(_ id: String) -> String {
+        app.sessions.first { $0.id == id }?.label ?? app.pane(id)?.title ?? "Closed"
+    }
+
+    private func mutedKind(_ id: String) -> String {
+        if app.sessions.contains(where: { $0.id == id }) { return "Session" }
+        if let p = app.pane(id) { return "Pane in \(p.sessionLabel)" }
+        return id.hasPrefix("session:") ? "A session that's gone" : "A pane that's gone"
+    }
 
     var body: some View {
         NavigationStack {
@@ -888,12 +901,30 @@ struct SettingsView: View {
                     Text("A Rex server, such as host.tailnet.ts.net:7297. Put account@ in front to connect as another account.")
                 }
                 Section {
-                    LabeledContent("Status", value: Push.shared.state)
-                    Button("Send a test notification") { Push.shared.test() }
+                    LabeledContent("Status", value: push.state)
+                    Button("Send a test notification") { push.test() }
                 } header: {
                     Text("Notifications")
                 } footer: {
                     Text("They come from irex-push on the server's machine: when an agent needs you or finishes, and a Live Activity with every agent on the lock screen and in the Dynamic Island.")
+                }
+                if !push.muted.isEmpty {
+                    Section {
+                        ForEach(push.muted.sorted(), id: \.self) { id in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(mutedName(id)).lineLimit(1)
+                                    Text(mutedKind(id)).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Unmute") { push.setMuted(id, false) }.buttonStyle(.bordered).controlSize(.small)
+                            }
+                        }
+                    } header: {
+                        Text("Muted")
+                    } footer: {
+                        Text("No notifications and no place in the Live Activity. orex shares this list.")
+                    }
                 }
                 if app.hosts.count > 1 {
                     Section {

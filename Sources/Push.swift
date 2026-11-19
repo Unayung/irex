@@ -31,10 +31,17 @@ final class Push: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     private let env = "production"
     #endif
 
+    /// irex-push runs beside the server, on port 7298.
+    @discardableResult
+    func useRelay(server address: String) -> Bool {
+        guard let ep = RexEndpoint(address), let host = ep.base.host else { return false }
+        relay = URL(string: "https://\(host):7298")
+        return true
+    }
+
     /// Turns on notifications for the server at `address`.
     func start(server address: String) {
-        guard let ep = RexEndpoint(address), let host = ep.base.host else { return }
-        relay = URL(string: "https://\(host):7298")
+        guard useRelay(server: address) else { return }
         Task {
             let center = UNUserNotificationCenter.current()
             let allowed = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false

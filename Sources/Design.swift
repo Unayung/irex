@@ -858,3 +858,52 @@ struct PaneOverview: View {
         .accessibilityLabel("\(p.title)\(here ? ", open now" : "")\(p.detail.isEmpty ? "" : ", \(p.detail)")")
     }
 }
+
+/// At the bottom of a pane whose agent waits on you: its choices as buttons, read off the screen,
+/// so answering doesn't need the keyboard. Gone once the agent moves on.
+struct AnswerBar: View {
+    @ObservedObject var stream: BlockStream
+    let pane: AppModel.Pane?
+
+    var body: some View {
+        if pane?.status == "blocked" {
+            // The terminal's own redraw hook is the view's, so read the screen once a second instead.
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                let options = ReplyOption.parse(stream.terminal.lastLines(30)).options
+                if !options.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(options) { o in
+                                chip(o.key, o.label) { stream.send(Data(o.key.utf8)) }
+                            }
+                            chip(nil, "Esc") { stream.send(stream.terminal.escapeKey) }
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                    }
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
+                    .padding(.horizontal, 10).padding(.bottom, 10)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+        }
+    }
+
+    private func chip(_ key: String?, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            action()
+        } label: {
+            HStack(spacing: 6) {
+                if let key {
+                    Text(key).font(.subheadline.monospaced().weight(.bold)).foregroundStyle(.tint)
+                }
+                Text(label).font(.subheadline.weight(.medium)).lineLimit(1).foregroundStyle(.primary)
+            }
+            .padding(.horizontal, 12).frame(minHeight: 36).frame(maxWidth: 240)
+            .background(Color(.secondarySystemBackground), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(key.map { "\($0), \(label)" } ?? label)
+    }
+}
